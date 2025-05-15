@@ -1,11 +1,12 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-# from torch.optim.lr_scheduler import CosineAnnealingLR # 暂时移除，因为优化器不在此定义
-from transformers import BertModel
+from transformers import BertModel, CLIPTextModel, CLIPTokenizer
 from torch_geometric.nn import GATConv
 import math
 from torch_geometric.nn import global_mean_pool
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
+from PIL import Image # 用于处理图像输出
 
 # TODO List:
 # - 将以下模块集成到一个完整的扩散模型框架 (例如 UNet + VAE + Scheduler) 中
@@ -23,167 +24,89 @@ from torch_geometric.nn import global_mean_pool
 # - ApoptosisMechanism: 实现检测高风险/攻击并禁用模型部分（如UNet中的Attention层）的逻辑
 # - epigenetic_prompt_encoding: 实现鲁棒的提示词编码/加密机制
 # - ImmunoDiffusionModel: Add epigenetic prompt handling if needed
+# - ImmunoDiffusionModel.forward: 实现完整的扩散循环，集成PDU, SEU, Memory, Apoptosis
+# - ImmunoDiffusionModel.forward: 确保所有组件的输入输出维度匹配
+# - ImmunoDiffusionModel.forward: 添加对 device (cuda/cpu) 的处理
 
 class PrivacyEnhancementUnit(nn.Module):
     """
-    安全增强单元 (SEU - Security Enhancement Unit)
+    安全增强单元 (SEU - Security Enhancement Unit) - Simplified Version
     模拟 B 细胞生成抗体（隐私保护噪声/扰动）的过程。
     在扩散模型的潜在空间中操作，根据风险评估动态调整防御策略。
     """
-    def __init__(self, latent_dim, noise_scale=0.1, base_sigma=0.1, epsilon=0.01, adaptive_strength=0.1):
+    def __init__(self, latent_dim, simple_noise_level=0.1): # Simplified __init__
         super().__init__()
-        # 基础噪声参数 (作用于潜在空间)
         self.latent_dim = latent_dim
-        self.noise_scale = nn.Parameter(torch.tensor(noise_scale))
-        self.base_sigma = nn.Parameter(torch.tensor(base_sigma))
-        self.epsilon = epsilon # 时间依赖噪声参数 (式6相关)
-        self.adaptive_strength = adaptive_strength
+        self.simple_noise_level = simple_noise_level
+        # Original parameters (noise_scale, base_sigma, epsilon, adaptive_strength) are removed for simplification.
 
-        # 简化版：保留参数化噪声，移除图像特定层
-        # 移除了 Conv2d 和 dropout2d，因为它们通常作用于图像空间而非潜在空间
-        # 如果需要在UNet的中间层操作，可以重新引入卷积或类似结构
-
-    def forward(self, z, t, risk_score, memory_signal=None):
+    def forward(self, z, t, risk_score, memory_signal=None): # t and memory_signal are ignored in this simplified version
         """
         在扩散过程的某一步应用防御。
         Args:
-            z (torch.Tensor): 当前步的潜在表示 (Latent representation)。
-            t (torch.Tensor): 当前时间步 (Timestep)。
-            risk_score (torch.Tensor): 来自 PDU 的风险评分 (0-1)。
-            memory_signal (torch.Tensor, optional): 来自 ImmuneMemoryModule 的信号 (Batch, memory_dim)。
-                                                     可用于指导更具针对性的扰动。
+            z (torch.Tensor): 当前步的潜在表示 (Latent representation).
+            t (torch.Tensor): 当前时间步 (Timestep) - ignored in simplified version.
+            risk_score (torch.Tensor): 来自 PDU 的风险评分 (0-1), shape [batch_size, 1] or [batch_size].
+            memory_signal (torch.Tensor, optional): 来自 ImmuneMemoryModule 的信号 - ignored.
         Returns:
             torch.Tensor: 添加了隐私保护扰动的潜在表示。
         """
-        batch_size = z.size(0)
-        risk_score = risk_score.view(batch_size, 1, 1, 1) # 扩展以匹配 z 的维度 (B, C, H, W)
-
-        # 1. 动态风险自适应基础噪声
-        current_noise_scale = self.adaptive_noise(risk_score)
-        noise_adaptive = torch.randn_like(z) * current_noise_scale
-        if not self.training: # 推理时也可加入少量基础噪声以防万一
-             noise_adaptive *= 0.5
-
-        # 2. 动态时间相关噪声 (式6 启发)
-        # sigma_t 通常是标量或每个 batch 一个值，这里假设它影响所有通道和维度
-        sigma_t_val = self.base_sigma * torch.sqrt(2 * self.epsilon / (t.float() + 1e-5))
-        # 确保 sigma_t_val 有正确的设备和形状 (B, 1, 1, 1)
-        sigma_t = sigma_t_val.view(-1, 1, 1, 1).to(z.device)
-        noise_temporal = torch.randn_like(z) * sigma_t
-
-        # 3. 结合 memory_signal 实现更复杂的潜在空间扰动
-        # 例如，如果 memory_signal 指示特定类型的威胁，应用不同的扰动策略
-        perturbation = noise_adaptive + noise_temporal
-        if memory_signal is not None:
-            # 示例：简单地将 memory_signal (需要投影到 z 空间) 添加为一种偏移
-            # projected_memory = self.memory_projector(memory_signal).view(batch_size, -1, 1, 1)
-            # perturbation += projected_memory * 0.1 # 乘以一个小的系数
-            pass # Placeholder for memory-guided perturbation
-
-        z_perturbed = z + perturbation
-
+        # Ensure risk_score is correctly shaped for broadcasting: [batch_size, 1, 1, 1]
+        current_risk_score = risk_score.view(-1, 1, 1, 1)
+        
+        noise = torch.randn_like(z) * current_risk_score * self.simple_noise_level
+        z_perturbed = z + noise
         return z_perturbed
 
-    def adaptive_noise(self, risk_level):
-        """根据隐私泄露风险动态调整基础噪声强度"""
-        # risk_level shape: (B, 1, 1, 1) or (B, 1)
-        adjusted_scale = self.noise_scale * (1 + risk_level.clamp(0, 1) * self.adaptive_strength)
-        return torch.clamp(adjusted_scale, min=0.01, max=0.5)
+    # def adaptive_noise(self, risk_level): # Removed for simplification
+    #     pass
 
-    def shm_update(self, feedback_signal=None):
-        """
-        体细胞高频突变模拟更新 (Somatic Hypermutation - SHM)
-        Args:
-            feedback_signal (float, optional): 代表防御效果的信号，例如对抗训练中的损失或评估指标。
-                                               正反馈（效果好）可能减少突变，负反馈（效果差）增加突变。
-        """
-        mutation_rate = 0.1
-        if feedback_signal is not None:
-            # 示例：效果越差（假设 feedback_signal 越大代表越差），突变率越高
-            mutation_rate *= torch.sigmoid(torch.tensor(feedback_signal)).item() * 2 # scale to [0, 0.2]
-
-        with torch.no_grad():
-            # 参数随机轻微变异
-            self.base_sigma.data *= (1 + mutation_rate * (torch.rand_like(self.base_sigma) - 0.5))
-            self.noise_scale.data *= (1 + mutation_rate * (torch.rand_like(self.noise_scale) - 0.5))
-            self.base_sigma.data.clamp_(min=0.001, max=1.0) # 调整范围
-            self.noise_scale.data.clamp_(min=0.001, max=1.0) # 调整范围
+    # def shm_update(self, feedback_signal=None): # Removed for simplification
+    #     pass
 
 
 class PrivacyDetectionUnit(nn.Module):
     """
-    隐私检测单元 (PDU - Privacy Detection Unit)
-    模拟抗原呈递细胞 (APC) 识别 和 T 细胞激活评估风险的过程。
-    使用双流架构（文本BioBERT + 知识图谱GAT）识别敏感语义并评估隐私泄露风险。
+    隐私检测单元 (PDU - Privacy Detection Unit) - Simplified Version
+    基于关键词检测风险。
     """
-    def __init__(self, biobert_model='monologg/biobert_v1.1_pubmed', concept_dim=200, embed_dim=512):
+    def __init__(self, sensitive_keywords: list[str], device: str, feature_dim: int = 512): # Simplified __init__
         super().__init__()
-        self.embed_dim = embed_dim
+        self.sensitive_keywords = [kw.lower() for kw in sensitive_keywords]
+        self.device = device
+        self.feature_dim = feature_dim # For dummy combined_features
 
-        # BioBERT 文本编码流 (模拟 APC 对文本抗原的处理)
-        self.biobert = BertModel.from_pretrained(biobert_model)
-        self.text_proj = nn.Linear(768, self.embed_dim)
+        # Original BioBERT and GAT components are removed for simplification.
+        # self.biobert = BertModel.from_pretrained(biobert_model_name)
+        # self.text_proj = nn.Linear(768, self.embed_dim)
+        # self.concept_encoder = GATConv(...)
+        # self.cross_attention = nn.MultiheadAttention(...)
+        # self.classifier = nn.Sequential(...)
 
-        # ConceptNet 知识图谱流 (模拟 APC 结合上下文信息)
-        # 假设 concept_dim 是输入节点特征维度
-        self.concept_encoder = GATConv(in_channels=concept_dim, out_channels=self.embed_dim // 2, heads=2) # GAT 输出维度需匹配
-        self.concept_relu = nn.LeakyReLU()
-        # GAT输出维度是 out_channels * heads = embed_dim
-
-        # 多头注意力融合层 (模拟 T 细胞接收 APC 信号)
-        self.cross_attention = nn.MultiheadAttention(embed_dim=self.embed_dim, num_heads=4, batch_first=True) # 使用 batch_first=True
-
-        # 风险分类器 (模拟 T 细胞激活决策)
-        self.classifier = nn.Sequential(
-            # 输入是 text_features 和 attention_output 拼接
-            nn.Linear(self.embed_dim * 2, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1) # 输出单一风险评分
-        )
-
-    def forward(self, text_input, concept_graph):
+    def forward(self, text_prompts: list[str], concept_graph=None): # concept_graph is ignored
         """
         Args:
-            text_input: BioBERT 的输入 (e.g., {'input_ids': ..., 'attention_mask': ...})
-            concept_graph: torch_geometric Data 对象 (包含 x, edge_index)
+            text_prompts (list[str]): A list of text prompts.
+            concept_graph: Ignored in this simplified version.
         Returns:
-            torch.Tensor: 隐私泄露风险评分 (0-1)
-            torch.Tensor: 融合后的特征表示 (可用于记忆模块)
+            torch.Tensor: 隐私泄露风险评分 (0-1), shape [batch_size, 1]
+            torch.Tensor: 融合后的特征表示 (dummy), shape [batch_size, feature_dim]
         """
-        # 文本特征提取
-        # 使用 [CLS] token 的输出作为句子表示
-        text_outputs = self.biobert(**text_input)
-        text_cls_hidden_state = text_outputs.last_hidden_state[:, 0, :] # [batch_size, 768]
-        text_features = self.text_proj(text_cls_hidden_state) # [batch_size, embed_dim]
+        batch_size = len(text_prompts)
+        risk_scores = []
+        for prompt in text_prompts:
+            prompt_lower = prompt.lower()
+            is_sensitive = any(keyword in prompt_lower for keyword in self.sensitive_keywords)
+            risk_scores.append(0.8 if is_sensitive else 0.1)
+        
+        risk_tensor = torch.tensor(risk_scores, dtype=torch.float32, device=self.device).unsqueeze(1)
+        
+        # Dummy combined_features
+        combined_features_dummy = torch.zeros(batch_size, self.feature_dim, device=self.device)
+        
+        return risk_tensor, combined_features_dummy
 
-        # 知识图谱特征提取 (假设 concept_graph.x 和 edge_index 已准备好)
-        # GATConv 通常期望 [num_nodes, in_channels]
-        concept_node_features = self.concept_encoder(concept_graph.x, concept_graph.edge_index) # [num_nodes, embed_dim]
-        concept_node_features = self.concept_relu(concept_node_features)
-        # 需要将节点特征聚合为图级别表示，这里简单使用平均池化
-        if concept_graph.batch is not None:
-             concept_features = global_mean_pool(concept_node_features, concept_graph.batch) # [batch_size, embed_dim]
-        else:
-             concept_features = concept_node_features.mean(dim=0, keepdim=True) # [1, embed_dim]
-             if text_features.size(0) > 1: # 如果 batch_size > 1, 复制图特征
-                 concept_features = concept_features.repeat(text_features.size(0), 1)
-
-
-        # 跨模态注意力融合 (文本特征作为 Query, 图谱特征作为 Key/Value)
-        # MultiheadAttention 需要 (N, L, E) 或 (L, N, E)
-        # 这里 L=1 (序列长度为1，代表整个文本/图)
-        query = text_features.unsqueeze(1) # [batch_size, 1, embed_dim]
-        key = value = concept_features.unsqueeze(1) # [batch_size, 1, embed_dim]
-        attn_output, _ = self.cross_attention(query, key, value) # [batch_size, 1, embed_dim]
-        attn_output = attn_output.squeeze(1) # [batch_size, embed_dim]
-
-        # 联合特征分类
-        combined_features = torch.cat([text_features, attn_output], dim=-1) # [batch_size, embed_dim * 2]
-        risk_score = torch.sigmoid(self.classifier(combined_features)) # [batch_size, 1]
-
-        return risk_score, combined_features # 返回风险评分和用于记忆的特征
-
-    # adversarial_training 方法保持不变，模拟进化
+    # adversarial_training 方法保持不变，模拟进化 (though may not be used with simplified PDU)
 
 
 class ImmuneMemoryModule(nn.Module):
@@ -347,6 +270,411 @@ def epigenetic_prompt_encoding(prompt: str) -> str:
 # 不适合在单个模型文件中实现。需要在分布式训练/推理框架中设计。
 
 # --- Main ImmunoDiffusion Wrapper (Conceptual) ---
+class ImmunoDiffusionModel(nn.Module):
+    def __init__(self, pdu_config, seu_config, memory_config, apoptosis_config=None, model_id="runwayml/stable-diffusion-v1-5", device="cuda" if torch.cuda.is_available() else "cpu"):
+        super().__init__()
+        self.device = device
+
+        # 加载基础扩散模型组件
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(self.device)
+        self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(self.device)
+        self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(self.device)
+        self.scheduler = PNDMScheduler.from_pretrained(model_id, subfolder="scheduler")
+
+        # 冻结 VAE 和 Text Encoder 的参数，因为我们通常不训练它们
+        for param in self.vae.parameters():
+            param.requires_grad = False
+        for param in self.text_encoder.parameters():
+            param.requires_grad = False
+        # UNet 的参数通常是可训练的，或者部分可训练 (例如，只训练 LoRA 层)
+
+        # 初始化免疫模块
+        # 确保 SEU 的 latent_dim 与 VAE 的潜空间维度一致
+        # Stable Diffusion v1.5 VAE 的潜空间通道数为 4
+        if 'latent_dim' not in seu_config:
+             seu_config['latent_dim'] = self.vae.config.latent_channels
+        self.pdu = PrivacyDetectionUnit(**pdu_config).to(self.device)
+        self.seu = PrivacyEnhancementUnit(**seu_config).to(self.device)
+        self.memory = ImmuneMemoryModule(**memory_config).to(self.device)
+        self.apoptosis = ApoptosisMechanism(**apoptosis_config) if apoptosis_config else None
+
+        # 获取UNet的输出通道数，用于调整SEU的输入 (如果SEU设计为操作UNet的输出而非潜变量本身)
+        # 当前SEU设计为操作潜变量 z，所以 latent_dim 是关键
+
+        # PDU的embed_dim 需要和text_encoder的输出兼容 (或者 PDU 内部的 text_proj 负责对齐)
+        # CLIPTextModel (e.g., 'openai/clip-vit-large-patch14') typically outputs 768.
+        # PDU's text_proj handles this: nn.Linear(768, self.embed_dim)
+        # PDU's concept_encoder GATConv output is self.embed_dim // 2 * heads, which should be self.embed_dim
+        # PDU's cross_attention embed_dim is self.embed_dim
+
+    def _encode_prompt(self, prompt, num_images_per_prompt=1, do_classifier_free_guidance=True, negative_prompt=None):
+        batch_size = len(prompt) if isinstance(prompt, list) else 1
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+            text_input_ids, untruncated_ids
+        ):
+            removed_text = self.tokenizer.batch_decode(
+                untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+            )
+            print(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+            )
+
+        text_embeddings = self.text_encoder(text_input_ids.to(self.device))[0] # [batch_size, seq_len, embed_dim]
+
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        bs_embed, seq_len, _ = text_embeddings.shape
+        text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
+        text_embeddings = text_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        if do_classifier_free_guidance:
+            uncond_tokens: list[str]
+            if negative_prompt is None:
+                uncond_tokens = [""] * batch_size
+            elif type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            elif isinstance(negative_prompt, str):
+                uncond_tokens = [negative_prompt]
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
+                )
+            else:
+                uncond_tokens = negative_prompt
+            
+            max_length = text_input_ids.shape[-1]
+            uncond_input = self.tokenizer(
+                uncond_tokens,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+
+            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+            seq_len = uncond_embeddings.shape[1]
+            uncond_embeddings = uncond_embeddings.repeat(1, num_images_per_prompt, 1)
+            uncond_embeddings = uncond_embeddings.view(batch_size * num_images_per_prompt, seq_len, -1)
+            
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        return text_embeddings
+
+    def _prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, generator, latents=None):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if latents is None:
+            if generator is not None:
+                latents = torch.randn(shape, generator=generator, device=self.device, dtype=dtype)
+            else:
+                latents = torch.randn(shape, device=self.device, dtype=dtype)
+        else:
+            latents = latents.to(self.device)
+        # scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
+
+    @property
+    def vae_scale_factor(self):
+        return 2 ** (len(self.vae.config.block_out_channels) - 1)
+
+    def _decode_latents(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents
+        image = self.vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        return image
+
+    def _numpy_to_pil(self, images):
+        """
+        Convert a numpy image or a batch of images to a PIL image.
+        """
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = (images * 255).round().astype("uint8")
+        if images.shape[-1] == 1:
+            # special case for grayscale (single channel) images
+            pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+        else:
+            pil_images = [Image.fromarray(image) for image in images]
+
+        return pil_images
+
+
+    @torch.no_grad() # 通常推理时不需要梯度
+    def forward(self, prompt: list[str] | str, concept_graph_data_list: list = None, # PDU 需要 concept_graph
+                height: int = 512, width: int = 512, num_inference_steps: int = 50,
+                guidance_scale: float = 7.5, negative_prompt: list[str] | str = None,
+                num_images_per_prompt: int = 1, generator: torch.Generator | None = None,
+                output_type: str = "pil", # "pil", "latent"
+                pdu_text_input_override: dict = None # 允许直接传入PDU的文本输入，否则从prompt构造
+               ):
+
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        if negative_prompt is not None and isinstance(negative_prompt, str):
+            negative_prompt = [negative_prompt]
+        
+        batch_size = len(prompt)
+
+        # 1. 文本编码 (Classifier-Free Guidance)
+        text_embeddings = self._encode_prompt(prompt, num_images_per_prompt, True, negative_prompt)
+
+        # 2. PDU 处理：风险评估和特征提取
+        # PDU 需要 tokenized input (e.g., BioBERT input) and concept_graph
+        # 我们需要将主模型的 prompt (原始文本) 适配给 PDU 的 BioBERT
+        # 假设 PDU 的 BioBERT 使用与主模型不同的 tokenizer 或需要特定格式
+        if pdu_text_input_override:
+            pdu_text_input = pdu_text_input_override
+        else:
+            # 简化：使用 PDU 自己的 tokenizer (如果它内部有的话) 或一个通用方式
+            # 为了演示，这里假设 PDU 的 biobert 也能处理 tokenizer 输出的 input_ids 和 attention_mask
+            # 但在实际中，PDU 的 biobert 可能有自己的 tokenizer
+            # 这里我们暂时使用主 tokenizer 的结果，PDU 的实现应能处理它
+            # 注意：PDU 的 forward 可能需要修改以接受与 CLIPTokenizer 不同的输入
+            # 这里我们创建一个虚拟的 concept_graph，实际应用中需要用户提供
+            # 此处我们仅为每个 batch item 准备文本输入
+            pdu_input_ids_list = []
+            pdu_attention_mask_list = []
+            
+            # PDU 内部的 BioBERT 需要自己的 tokenizer，这里为了代码能跑通，
+            # 我们假设它和 CLIP tokenizer 输出的字典格式兼容，或者 PDU.forward 里处理。
+            # 正确的做法是 PDU 应该暴露一个 `process_text` 方法或在 `__init__` 时接收 tokenizer
+            temp_tokenizer_for_pdu = self.tokenizer # 临时代用
+            for p_idx, p_item in enumerate(prompt):
+                tokenized_pdu_text = temp_tokenizer_for_pdu(
+                    p_item, padding="max_length", max_length=77, # BioBERT 通常有自己的 max_length
+                    truncation=True, return_tensors="pt"
+                )
+                pdu_input_ids_list.append(tokenized_pdu_text.input_ids.squeeze(0))
+                pdu_attention_mask_list.append(tokenized_pdu_text.attention_mask.squeeze(0))
+
+            # 将列表堆叠成批次
+            pdu_biobert_input = {
+                'input_ids': torch.stack(pdu_input_ids_list).to(self.device),
+                'attention_mask': torch.stack(pdu_attention_mask_list).to(self.device)
+            }
+        
+        # 准备 concept_graph batch
+        # 假设 concept_graph_data_list 是一个 Data 对象的列表，长度与 batch_size 相同
+        # 如果为 None, PDU 需要能处理这种情况
+        current_concept_graph = None
+        if concept_graph_data_list:
+            from torch_geometric.data import Batch
+            try:
+                current_concept_graph = Batch.from_data_list(concept_graph_data_list).to(self.device)
+            except Exception as e:
+                print(f"Warning: Could not create batch from concept_graph_data_list: {e}. PDU might not use graph features.")
+                current_concept_graph = None # fallback
+        
+        # 如果 concept_graph_data_list 为空或处理失败，PDU 需要一个占位符或能优雅处理
+        # PDU 的 forward 逻辑需要确保在 concept_graph 为 None 时不会崩溃
+        # (其当前实现会尝试 .mean(dim=0) 如果 batch is None, 但 x 可能不存在)
+        # 为了能运行，如果 current_concept_graph 是 None, 我们需要传递一个 PDU 能处理的结构
+        if current_concept_graph is None:
+            # 创建一个最小的、空的 Data 对象，PDU.forward 应该有鲁棒性处理
+            from torch_geometric.data import Data
+            # PDU 的 concept_encoder in_channels 是 concept_dim，默认为 200
+            # PDU 的 embed_dim 默认为 512
+            # GATConv in_channels=concept_dim, out_channels=embed_dim // 2
+            # 我们需要确保 dummy_x 有正确的第二维度 (concept_dim)
+            concept_dim_pdu = self.pdu.concept_encoder.in_channels 
+            dummy_x = torch.empty((0, concept_dim_pdu), device=self.device) # 0个节点，但有正确的特征维度
+            dummy_edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            current_concept_graph = Data(x=dummy_x, edge_index=dummy_edge_index, batch=None).to(self.device)
+
+
+        risk_score, combined_features = self.pdu(pdu_biobert_input, current_concept_graph)
+        # risk_score: [batch_size * num_images_per_prompt, 1]
+        # combined_features: [batch_size * num_images_per_prompt, pdu.embed_dim * 2]
+        # 如果 PDU 的 batch size 与 text_embeddings 不一致 (因为 CFG)，需要调整
+        # PDU 的输入是原始 prompt，输出 batch_size。text_embeddings 是 batch_size * 2 (CFG) * num_img
+        # 我们假设PDU只针对原始prompt评估风险，然后将风险应用到所有图像和CFG上
+        # 或者，PDU应该在_encode_prompt之后，对包括uncond的embeddings进行评估
+        # 为简单起见，假设PDU的风险评分和特征是针对每个原始prompt的，需要扩展
+        
+        actual_batch_size_for_unet = text_embeddings.shape[0] # This is batch_size * num_images_per_prompt * (2 if CFG else 1)
+        
+        # 扩展 risk_score 和 combined_features 以匹配 UNet 的批次大小
+        # PDU 的输出是 [batch_size, 1] 和 [batch_size, feature_dim]
+        # 我们需要扩展到 [actual_batch_size_for_unet, ...]
+        # 如果启用了CFG，UNet的输入批次是 (uncond + cond) * num_images_per_prompt
+        # risk_score 和 combined_features 应该只基于 cond prompt 计算，然后广播
+        
+        # 假设 PDU 的输出 batch_size 已经等于 len(prompt) * num_images_per_prompt
+        # 如果 PDU 只处理了原始 prompt (len(prompt))，需要扩展：
+        if risk_score.shape[0] == batch_size:
+            risk_score = risk_score.repeat_interleave(num_images_per_prompt, dim=0)
+            combined_features = combined_features.repeat_interleave(num_images_per_prompt, dim=0)
+
+        # 如果启用了CFG，还需要为uncond部分复制/生成risk_score和features
+        # 简单处理：对uncond部分使用零风险/零特征，或复制cond的风险
+        if guidance_scale > 1.0: # CFG enabled
+            # 当前 risk_score 和 combined_features 是 [batch_size * num_images_per_prompt, ...]
+            # 需要变成 [2 * batch_size * num_images_per_prompt, ...]
+            # 对于 uncond 部分，可以假设风险为0或复制cond的风险。这里复制。
+            risk_score_uncond = risk_score.clone() # Or torch.zeros_like(risk_score)
+            risk_score = torch.cat([risk_score_uncond, risk_score])
+
+            combined_features_uncond = combined_features.clone() # Or torch.zeros_like(combined_features)
+            combined_features = torch.cat([combined_features_uncond, combined_features])
+
+
+        # 3. 更新/查询免疫记忆模块
+        # update_memory 应该只用高风险的条件提示特征
+        # query_memory 可以用所有条件提示的特征
+        # 假设 combined_features 现在是 [2 * B_eff, dim], 我们只需要 B_eff (条件部分)
+        cond_combined_features = combined_features[batch_size * num_images_per_prompt:] if guidance_scale > 1.0 else combined_features
+        # 假设 risk_score 也是 [2 * B_eff, 1], cond_risk_score 是后半部分
+        cond_risk_score = risk_score[batch_size * num_images_per_prompt:] if guidance_scale > 1.0 else risk_score
+
+        # 根据风险决定是否更新记忆 (例如，只用平均风险大于阈值的特征)
+        # PDU 返回的 combined_features 是 [batch_size, embed_dim*2]
+        # ImmuneMemoryModule 的 input_dim 应与此匹配
+        if cond_risk_score.mean() > 0.5: # 示例阈值
+             self.memory.update_memory(cond_combined_features)
+        memory_signal = self.memory.query_memory(cond_combined_features) # [B_eff, memory_dim]
+
+        if memory_signal is not None and guidance_scale > 1.0:
+            # 为CFG的uncond部分添加空的memory_signal
+            memory_signal_uncond = torch.zeros_like(memory_signal)
+            memory_signal = torch.cat([memory_signal_uncond, memory_signal])
+        elif memory_signal is None and actual_batch_size_for_unet > 0 : # 确保即使memory_signal是None，后续代码也能处理
+             # memory_dim 来自 ImmuneMemoryModule
+             mem_dim = self.memory.memory_dim
+             memory_signal = torch.zeros(actual_batch_size_for_unet, mem_dim, device=self.device)
+
+
+        # 4. 检查细胞凋亡
+        if self.apoptosis:
+            # 使用条件提示的平均风险
+            avg_cond_risk = cond_risk_score.mean().item()
+            if self.apoptosis.check_and_trigger(avg_cond_risk, self.unet):
+                print("Generation halted due to Apoptosis.")
+                if output_type == "pil":
+                    # 返回一个表示错误的图像或空列表
+                    # 创建一个简单的黑色图像作为占位符
+                    error_img = Image.new('RGB', (width, height), color = 'black')
+                    return [error_img] * (batch_size * num_images_per_prompt)
+                elif output_type == "latent":
+                    return torch.zeros(batch_size * num_images_per_prompt, self.vae.config.latent_channels, height // self.vae_scale_factor, width // self.vae_scale_factor, device=self.device) # 返回空潜变量
+
+        # 5. 准备潜变量 (Initial Latents)
+        num_channels_latents = self.unet.config.in_channels # 通常是 4 for SD
+        latents = self._prepare_latents(
+            batch_size * num_images_per_prompt, # 注意这里的batch_size是原始输入prompt数量
+            num_channels_latents,
+            height,
+            width,
+            text_embeddings.dtype, # 通常是 float16 或 float32
+            generator
+        )
+
+        # 6. 设置时间步
+        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        # 7. 去噪循环
+        for i, t in enumerate(timesteps):
+            #扩展潜变量以匹配text_embeddings的批次大小 (CFG)
+            latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            # 预测噪声 (UNet)
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=text_embeddings,
+            ).sample
+
+            # 执行 Classifier-Free Guidance
+            if guidance_scale > 1.0:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # SEU 应用：扰动潜变量
+            # SEU 需要 risk_score 和 memory_signal
+            # risk_score 和 memory_signal 需要与当前的 latents (去噪步骤输出) 的 batch_size 匹配
+            # latents 是 [B_eff, C, H, W], risk_score 是 [2*B_eff, 1], memory_signal 是 [2*B_eff, mem_dim]
+            # SEU应该只作用于条件部分，还是两者？如果两者，非条件部分风险为0？
+            # 为简单起见，假设SEU接收与noise_pred相同batch size的risk_score和memory_signal
+            # 但risk_score和memory_signal是基于原始prompt生成的，然后扩展到CFG
+            # 此时的noise_pred是 [B_eff, C, H, W] (经过CFG合并后)
+            # 我们需要 B_eff 大小的 risk_score (条件风险) 和 memory_signal (条件记忆)
+            
+            # 从CFG扩展的risk_score和memory_signal中取条件部分
+            current_risk_for_seu = cond_risk_score # [B_eff, 1]
+            current_memory_for_seu = memory_signal[batch_size * num_images_per_prompt:] if guidance_scale > 1.0 and memory_signal is not None else memory_signal
+            if current_memory_for_seu is not None and current_memory_for_seu.shape[0] != latents.shape[0]: # B_eff
+                 # 如果 memory_signal 在 CFG 情况下未正确处理或为None后生成了错误尺寸的zeros
+                 if memory_signal is not None and guidance_scale > 1.0: #  memory_signal是 [2*B_eff, dim]
+                     current_memory_for_seu = memory_signal[latents.shape[0]:]
+                 elif memory_signal is None: # 如果一开始就是None
+                     current_memory_for_seu = None # 保持None
+
+            # 确保SEU的risk_score和latents的batch size一致
+            if current_risk_for_seu.shape[0] != latents.shape[0]:
+                 # Fallback: use mean risk or zero risk if dimensions mismatch
+                 print(f"Warning: SEU risk_score batch mismatch. Latents: {latents.shape[0]}, Risk: {current_risk_for_seu.shape[0]}. Using mean risk.")
+                 current_risk_for_seu = current_risk_for_seu.mean(dim=0, keepdim=True).repeat(latents.shape[0], 1)
+
+
+            perturbed_noise_pred = self.seu(noise_pred, t, current_risk_for_seu, current_memory_for_seu)
+            # SEU 的 forward 返回的是 z_perturbed，这里我们假设它扰动的是 noise_pred
+            # 或者 SEU 应该在 scheduler.step 之后操作 latents
+            # 按照原始论文的思路，SEU 是在扩散的某一步应用防御，操作的是 z (latent)
+            # 所以 SEU 应该在 scheduler.step 之后。
+            # 然而，更常见的做法是在噪声预测上加扰动，或者修改 UNet 行为。
+            # 为了简单集成，这里假设 SEU 修改的是 noise_pred。如果SEU要修改latent，需要调整位置。
+            # 如果 SEU.forward 返回的是 z_perturbed (潜变量)，那么它应该这样调用：
+            # latents_before_seu = self.scheduler.step(noise_pred, t, latents).prev_sample
+            # latents = self.seu(latents_before_seu, t, current_risk_for_seu, current_memory_for_seu)
+
+            # 当前 SEU.forward(z, t, risk_score, memory_signal) 返回 z_perturbed
+            # 为了使其适配当前循环，让 SEU 扰动的是 latents
+            # 我们先用 scheduler.step 得到 prev_sample，然后应用 SEU
+
+            # 计算上一步的潜变量 (Scheduler)
+            prev_latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+            # 应用SEU到上一步的潜变量
+            latents = self.seu(prev_latents, t, current_risk_for_seu, current_memory_for_seu)
+
+
+        # 8. 解码图像 (VAE)
+        if output_type == "latent":
+            return latents
+
+        images = self._decode_latents(latents)
+
+        # 9. 转换为 PIL 图像
+        if output_type == "pil":
+            images = self._numpy_to_pil(images)
+
+        return images
+
+
 # class ImmunoDiffusionModel(nn.Module):
 #     def __init__(self, base_diffusion_model, pdu_config, seu_config, memory_config, apoptosis_config):
 #         super().__init__()
@@ -362,33 +690,49 @@ def epigenetic_prompt_encoding(prompt: str) -> str:
 
 #         # 2. Process prompt with PDU (using diffusion model's text encoder or PDU's own)
 #         # Assume text_input prepared for PDU's BioBERT
-#         text_input = self.prepare_text_input(text_prompt)
+#         text_input = self.prepare_text_input(text_prompt) # This needs to be defined
 #         risk_score, combined_features = self.pdu(text_input, concept_graph)
 
 #         # 3. Update/Query Memory
 #         # Only update memory for risky prompts?
-#         if risk_score.mean() > 0.5:
+#         if risk_score.mean() > 0.5: # Example threshold
 #              self.memory.update_memory(combined_features)
 #         memory_signal = self.memory.query_memory(combined_features)
 
 #         # 4. Check for Apoptosis
-#         if self.apoptosis and self.apoptosis.check_and_trigger(risk_score.mean(), self.diffusion_model.unet):
+#         if self.apoptosis and self.apoptosis.check_and_trigger(risk_score.mean(), self.diffusion_model.unet): # Pass unet part of diffusion_model
 #              # Handle triggered state (e.g., return error, generate placeholder)
 #              print("Generation halted due to Apoptosis.")
 #              return None # Or a default safe image
 
 #         # 5. Run Diffusion Process (Conceptual Loop)
-#         # Assuming a standard diffusion loop structure
-#         # The key modification is inside the loop:
-#         # predicted_noise = self.diffusion_model.unet(noisy_latents, timestep, encoder_hidden_states=...)
-#         # current_latent = scheduler.step(predicted_noise, timestep, noisy_latents).prev_sample
-#         # --- Modification ---
-#         # perturbed_latent = self.seu(current_latent, timestep, risk_score, memory_signal)
-#         # next_latent = perturbed_latent # Use perturbed latent for next step
-#         # --- End Modification ---
-
-#         # 6. Decode final latent with VAE
-#         # image = self.diffusion_model.vae.decode(final_latent / scale_factor).sample
+#         # This needs full implementation using self.diffusion_model components (scheduler, unet)
+#         # and integrating self.seu
+#         # Example:
+#         # latents = initial_latents
+#         # self.scheduler.set_timesteps(num_inference_steps)
+#         # for t in self.scheduler.timesteps:
+#         #     # Prepare input for UNet (handle CFG if used)
+#         #     unet_input = torch.cat([latents] * 2) if do_cfg else latents
+#         #     unet_input = self.scheduler.scale_model_input(unet_input, t)
+#         #
+#         #     # Predict noise
+#         #     noise_pred = self.diffusion_model.unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
+#         #
+#         #     # CFG
+#         #     if do_cfg:
+#         #        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+#         #        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+#         #
+#         #     # Get previous sample
+#         #     prev_sample = self.scheduler.step(noise_pred, t, latents).prev_sample
+#         #
+#         #     # Apply SEU
+#         #     # Ensure risk_score and memory_signal are correctly shaped and aligned with prev_sample
+#         #     latents = self.seu(prev_sample, t, risk_score, memory_signal) # SEU operates on latents
+#         #
+#         # # 6. Decode final latent with VAE
+#         # image = self.diffusion_model.vae.decode(latents / self.diffusion_model.vae.config.scaling_factor).sample
 #         # return image
 
-#         pass # This forward method needs full implementation within a diffusion framework
+        pass # This forward method needs full implementation within a diffusion framework

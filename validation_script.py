@@ -7,316 +7,377 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 import os
-# Assuming your model components are importable
-# from Immuno_Diffusion import ImmunoDiffusionModel, PrivacyDetectionUnit, PrivacyEnhancementUnit, ImmuneMemoryModule # Adjust import path as needed
-# Or load components individually if the main wrapper isn't fully implemented yet
-# from some_diffusion_library import UNet, VAE, Scheduler, TextEncoder # Example
-from transformers import BertTokenizer, BertModel, CLIPProcessor, CLIPModel # For PDU and SLI
-# from torch_geometric.data import Data # If using concept graphs
-# import torchmetrics # For FID
+import pathlib # For save_results to handle Path objects if any in args
 
-# Placeholder for your actual model loading and data preparation logic
+from diffusers import AutoencoderKL, UNet2DConditionModel, EulerDiscreteScheduler
+# from diffusers.utils import randn_tensor # -> Replaced with torch.randn
+from transformers import CLIPTextModel, CLIPTokenizer
+
+# 导入简化的PDU和SEU
+from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit 
+
+print(f"--- Python Script Start ---")
+# 先设置节点在终端$env:HF_ENDPOINT = "https://hf-mirror.com"
+print(f"HF_ENDPOINT from os.environ: {os.getenv('HF_ENDPOINT')}")
+print(f"--- End of ENV Check ---")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Immuno-Diffusion Validation Script")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the pretrained ImmunoDiffusion model or components")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the evaluation dataset (e.g., a csv/json file with prompts)")
-    parser.add_argument("--sensitive_keywords_path", type=str, help="Path to a file listing sensitive keywords for SLI calculation")
-    parser.add_argument("--reference_fid_path", type=str, required=True, help="Path to the directory with reference images for FID")
-    parser.add_argument("--output_dir", type=str, default="./validation_output", help="Directory to save generated images and results")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for generation and evaluation")
-    parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate for evaluation")
+    # Modify dataset_path to be optional for hardcoded mode
+    parser.add_argument("--dataset_path", type=str, default="internal_test_prompts", help="Path to the evaluation dataset or 'internal_test_prompts' for hardcoded prompts")
+    parser.add_argument("--model_id", type=str, default="runwayml/stable-diffusion-v1-5", help="Hugging Face model ID for the base diffusion model")
+    parser.add_argument("--sensitive_keywords_path", type=str, help="Path to a file listing sensitive keywords for SLI calculation (also used by simplified PDU if no explicit list provided)")
+    parser.add_argument("--pdu_sensitive_keywords", type=str, nargs='+', default=["secret", "private", "confidential", "internal"], help="List of sensitive keywords for the simplified PDU.")
+    parser.add_argument("--seu_noise_level", type=float, default=0.05, help="Noise level for the simplified SEU.")
+    parser.add_argument("--reference_fid_path", type=str, help="Path to the directory with reference images for FID. Required if --calculate_fid is set.")
+    parser.add_argument("--output_dir", type=str, default="./validation_output_hardcoded", help="Directory to save generated images and results") # Changed default for hardcoded
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation.")
+    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples to generate (will be overridden if using internal_test_prompts)") # Default for general use
+    parser.add_argument("--image_size", type=int, default=256, help="Size of generated images (height and width) - smaller for faster hardcoded test") # Smaller for faster test
+    parser.add_argument("--guidance_scale", type=float, default=7.5, help="Guidance scale for classifier-free guidance")
+    parser.add_argument("--num_inference_steps", type=int, default=30, help="Number of DDIM inference steps - fewer for faster hardcoded test") # Fewer for faster test
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for generation") # Default seed for consistency
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on")
     parser.add_argument("--enable_privacy", action="store_true", help="Enable Immuno-Diffusion privacy mechanisms")
-    # Add more arguments for specific configurations (risk thresholds, etc.)
-    return parser.parse_args()
+    parser.add_argument("--calculate_fid", action="store_true", help="Calculate FID score.")
+    parser.add_argument("--calculate_sli", action="store_true", help="Calculate SLI score.")
+
+    args = parser.parse_args([] if __name__ == "__main__" and os.getenv("RUNNING_AS_MAIN_SCRIPT_FOR_HARCODING") else None) # Parse no args if hardcoding intended for direct run
+    
+    if args.dataset_path != "internal_test_prompts" and not os.path.exists(args.dataset_path):
+        parser.error(f"Dataset path {args.dataset_path} does not exist and is not 'internal_test_prompts'.")
+
+    if args.calculate_fid and not args.reference_fid_path:
+        parser.error("--reference_fid_path is required when --calculate_fid is set.")
+    
+    if args.enable_privacy: # Check PDU keywords only if privacy is enabled
+        pdu_kws_provided = bool(args.pdu_sensitive_keywords and args.pdu_sensitive_keywords != ["secret", "private", "confidential", "internal"]) # Check if non-default
+        loaded_from_file = False
+        if not pdu_kws_provided and args.sensitive_keywords_path and os.path.exists(args.sensitive_keywords_path):
+            print(f"Using sensitive keywords from {args.sensitive_keywords_path} for PDU as --pdu_sensitive_keywords was not set to a custom list.")
+            with open(args.sensitive_keywords_path, 'r', encoding='utf-8') as f:
+                args.pdu_sensitive_keywords = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            loaded_from_file = True
+        
+        if not args.pdu_sensitive_keywords:
+            print("Warning: PDU is enabled but no sensitive keywords are defined. PDU might not detect any risk.")
+            args.pdu_sensitive_keywords = []
+        elif not loaded_from_file and pdu_kws_provided:
+             print(f"PDU using custom keywords: {args.pdu_sensitive_keywords}")
+        elif not loaded_from_file and not pdu_kws_provided:
+             print(f"PDU using default keywords: {args.pdu_sensitive_keywords}")
+
+
+    return args
 
 def load_models(args):
     """Loads the necessary models."""
     print("Loading models...")
     device = torch.device(args.device)
+    model_id = args.model_id
 
-    # --- Load Your Diffusion Model Components ---
-    # Example:
-    # text_encoder = TextEncoder.from_pretrained(...)
-    # vae = VAE.from_pretrained(...)
-    # unet = UNet.from_pretrained(...)
-    # scheduler = Scheduler.from_pretrained(...)
-    # text_encoder.to(device)
-    # vae.to(device)
-    # unet.to(device)
-    print("Base diffusion components loaded (Placeholder).")
+    try:
+        # 这些调用会受到 HF_ENDPOINT 环境变量的影响
+        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+        vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
+        unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
+        scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
+        print(f"Base diffusion components ({model_id}) loaded successfully.")
+    except Exception as e:
+        print(f"Error loading base diffusion model from {model_id}: {e}")
+        print("Please ensure the model_id is correct and you have an internet connection if downloading, or the model is cached.")
+        raise
 
-
-    # --- Load Immuno-Diffusion Components (if enabled) ---
-    pdu, seu, memory = None, None, None
+    pdu, seu = None, None
     if args.enable_privacy:
-        # pdu = PrivacyDetectionUnit(...) # Load with config/checkpoint
-        # seu = PrivacyEnhancementUnit(...) # Load with config/checkpoint
-        # memory = ImmuneMemoryModule(...) # Load with config/checkpoint
-        # pdu.to(device)
-        # seu.to(device)
-        # memory.to(device) # Memory might stay on CPU depending on usage
-        print("Immuno-Diffusion components loaded (Placeholder).")
+        print(f"Privacy mechanisms enabled. Initializing simplified PDU and SEU.")
+        # PDU expects feature_dim for its dummy output, matching ImmuneMemoryModule input_dim (default 512)
+        pdu = PrivacyDetectionUnit(sensitive_keywords=args.pdu_sensitive_keywords, device=args.device, feature_dim=512).to(device)
+        
+        seu_latent_dim = unet.config.in_channels
+        seu = PrivacyEnhancementUnit(latent_dim=seu_latent_dim, simple_noise_level=args.seu_noise_level).to(device)
+        print(f"Simplified PDU and SEU initialized. PDU keywords: {args.pdu_sensitive_keywords}, SEU noise: {args.seu_noise_level}.")
     else:
-        print("Immuno-Diffusion components disabled.")
+        print("Privacy mechanisms disabled.")
 
-    # --- Load Evaluation Models ---
-    # clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-    # clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    # print("CLIP model loaded for SLI.")
-    # fid_metric = torchmetrics.image.FrechetInceptionDistance(feature=2048).to(device)
-    # print("FID metric initialized.")
+    clip_model, clip_processor, fid_metric = None, None, None 
 
-
-    # Placeholder: return actual loaded models
     models = {
-        # "text_encoder": text_encoder, "vae": vae, "unet": unet, "scheduler": scheduler,
-        "pdu": pdu, "seu": seu, "memory": memory,
-        # "clip_model": clip_model, "clip_processor": clip_processor,
-        # "fid_metric": fid_metric,
-        "device": device
+        "tokenizer": tokenizer, "text_encoder": text_encoder,
+        "vae": vae, "unet": unet, "scheduler": scheduler,
+        "pdu": pdu, "seu": seu, 
+        "clip_model": clip_model, "clip_processor": clip_processor, 
+        "fid_metric": fid_metric, 
+        "device": device,
+        "vae_scale_factor": 2 ** (len(vae.config.block_out_channels) - 1)
     }
-    print("Models loaded successfully.")
+    print("Models dictionary created.")
     return models
 
 def load_dataset(args):
-    """Loads the evaluation dataset."""
-    print(f"Loading dataset from {args.dataset_path}...")
-    # Placeholder: Load your prompts, potentially sensitive flags, and concept graph data
-    # Example: Load prompts from a CSV
-    # import pandas as pd
-    # df = pd.read_csv(args.dataset_path)
-    # prompts = df['prompt'].tolist()[:args.num_samples]
-    prompts = [f"Sample prompt {i}" for i in range(args.num_samples)] # Dummy data
-    sensitive_flags = [i % 5 == 0 for i in range(args.num_samples)] # Dummy data: every 5th prompt is "sensitive"
-    print(f"Loaded {len(prompts)} prompts.")
+    """Loads the evaluation dataset. If args.dataset_path is 'internal_test_prompts', uses hardcoded prompts."""
+    prompts_to_use = []
+    sensitive_flags = [] # Corresponding flags for prompts
+    sli_sensitive_keywords = [] # Keywords for SLI calculation, separate from PDU
 
-    sensitive_keywords = []
+    if args.dataset_path == "internal_test_prompts":
+        print("Using internal hardcoded test prompts.")
+        prompts_to_use = [
+            "A photorealistic cat riding a unicorn on a rainbow",
+            "A vibrant oil painting of a bustling Parisian cafe in the rain",
+            "My secret project is about a confidential meeting for a new recipe" # Contains PDU default keywords
+        ]
+        # For hardcoded prompts, we can manually set sensitive_flags if needed for other logic,
+        # but for basic generation, it's not critical.
+        # Here, we mark the third one as potentially sensitive for demonstration if SLI were active.
+        sensitive_flags = [False, False, True] 
+        args.num_samples = len(prompts_to_use) # Ensure all hardcoded prompts are used
+        print(f"Loaded {len(prompts_to_use)} hardcoded prompts.")
+    else:
+        print(f"Loading dataset from {args.dataset_path}...")
+        prompts_data = []
+        if args.dataset_path.endswith('.csv'):
+            try:
+                import pandas as pd
+                df = pd.read_csv(args.dataset_path)
+                if 'prompt' not in df.columns:
+                    raise ValueError("CSV file must contain a 'prompt' column.")
+                prompts_data = df['prompt'].astype(str).tolist()
+            except ImportError:
+                print("Pandas not installed, please install to load CSV datasets or use a .txt file.")
+                raise
+            except Exception as e:
+                print(f"Error loading CSV: {e}")
+                raise
+        elif args.dataset_path.endswith('.txt'):
+            try:
+                with open(args.dataset_path, 'r', encoding='utf-8') as f:
+                    prompts_data = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            except Exception as e:
+                print(f"Error loading TXT file: {e}")
+                raise
+        else:
+            print(f"Unsupported dataset file format: {args.dataset_path}. Please use .csv or .txt")
+            # Fallback to dummy data if dataset loading fails for some reason or not specified properly
+        
+        if not prompts_data:
+            print("No prompts loaded from dataset file, using fallback dummy prompts.")
+            prompts_data = [f"Fallback sample prompt {i}" for i in range(args.num_samples)] 
+        
+        prompts_to_use = prompts_data[:args.num_samples]
+        sensitive_flags = [i % 5 == 0 for i in range(len(prompts_to_use))] # Dummy flags for external datasets
+        print(f"Loaded/selected {len(prompts_to_use)} prompts for generation from file.")
+
+    # Load SLI sensitive keywords (distinct from PDU keywords, though can be from same file)
     if args.sensitive_keywords_path and os.path.exists(args.sensitive_keywords_path):
-        with open(args.sensitive_keywords_path, 'r') as f:
-            sensitive_keywords = [line.strip() for line in f if line.strip()]
-        print(f"Loaded {len(sensitive_keywords)} sensitive keywords.")
+        with open(args.sensitive_keywords_path, 'r', encoding='utf-8') as f:
+            sli_sensitive_keywords = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        print(f"Loaded {len(sli_sensitive_keywords)} sensitive keywords for SLI calculation.")
+    elif args.calculate_sli:
+        print("Warning: --calculate_sli is set but --sensitive_keywords_path was not provided or found for SLI.")
 
-    return prompts, sensitive_flags, sensitive_keywords
+    return prompts_to_use, sensitive_flags, sli_sensitive_keywords
 
-def prepare_text_input(prompts, tokenizer, device):
-    """Prepare text input for BioBERT or other text encoders."""
-    # Placeholder: Implement based on your PDU's expected input format
-    # return tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").to(device)
-    print("Preparing text input (Placeholder)...")
-    return {"input_ids": None, "attention_mask": None} # Dummy
-
-def prepare_graph_input(batch_size, device):
-     """Prepare graph input for PDU (if needed)."""
-     # Placeholder: Load or generate graph data
-     # Example: Create dummy graph data
-     # x = torch.randn(batch_size * 10, 200) # B*num_nodes_per_graph, node_feature_dim
-     # edge_index = torch.randint(0, batch_size * 10, (2, batch_size * 30)) # Dummy edges
-     # batch = torch.arange(batch_size).repeat_interleave(10)
-     # graph_data = Data(x=x, edge_index=edge_index, batch=batch).to(device)
-     print("Preparing graph input (Placeholder)...")
-     return None # Return graph_data if used
+# ... prepare_text_input, prepare_graph_input remain placeholders ...
 
 @torch.no_grad()
 def generate_images(prompts, models, args):
-    """Generates images using the diffusion model with optional privacy protection."""
-    print(f"Generating images ({'with' if args.enable_privacy else 'without'} privacy)...")
+    """Generates images using the base diffusion model, with optional simplified privacy modules."""
+    if args.enable_privacy and models.get("pdu") and models.get("seu"):
+        print(f"Generating images with simplified PDU/SEU privacy mechanisms enabled (SEU Noise: {args.seu_noise_level}).")
+    else:
+        print(f"Generating images using base diffusion model (privacy mechanisms disabled or not loaded).")
+        
     device = models["device"]
-    generated_images = []
-    # Assuming you have access to text_encoder, vae, unet, scheduler from models dict
+    tokenizer = models["tokenizer"]
+    text_encoder = models["text_encoder"]
+    vae = models["vae"]
+    unet = models["unet"]
+    scheduler = models["scheduler"]
+    vae_scale_factor = models["vae_scale_factor"]
 
-    # Placeholder for the diffusion generation loop
-    num_batches = (len(prompts) + args.batch_size - 1) // args.batch_size
+    pdu = models.get("pdu")
+    seu = models.get("seu")
+
+    height = args.image_size
+    width = args.image_size
+    num_inference_steps = args.num_inference_steps
+    guidance_scale = args.guidance_scale
+    batch_size = args.batch_size
+
+    # Use a generator for reproducible results if seed is provided
+    generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
+    if args.seed is not None: # Also set global Pytorch seed
+        torch.manual_seed(args.seed)
+        if device == "cuda": torch.cuda.manual_seed_all(args.seed)
+
+    generated_images_pil = []
+    num_batches = (len(prompts) + batch_size - 1) // batch_size
+
     for i in tqdm(range(num_batches), desc="Generating Batches"):
-        batch_prompts = prompts[i * args.batch_size : (i + 1) * args.batch_size]
+        batch_prompts = prompts[i * batch_size : (i + 1) * batch_size]
+        current_batch_size = len(batch_prompts)
 
-        # 1. Encode prompts (using base model's or PDU's encoder)
-        # text_embeddings = models["text_encoder"](batch_prompts...) # Or however you get embeddings
-        # text_embeddings = torch.randn(len(batch_prompts), 768).to(device) # Dummy
+        text_input = tokenizer(batch_prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
 
-        # --- Immuno-Diffusion Steps (if enabled) ---
-        risk_score, combined_features, memory_signal = None, None, None
-        if args.enable_privacy and models["pdu"] is not None:
-             # Prepare PDU inputs
-             # pdu_text_input = prepare_text_input(batch_prompts, pdu_tokenizer, device)
-             # pdu_graph_input = prepare_graph_input(len(batch_prompts), device)
-             # risk_score, combined_features = models["pdu"](pdu_text_input, pdu_graph_input) # [B, 1], [B, embed_dim*2]
+        if guidance_scale > 1.0:
+            max_length = text_input.input_ids.shape[-1]
+            uncond_input = tokenizer([""] * current_batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
+            uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
-             # Update/Query Memory
-             # models["memory"].update_memory(combined_features[risk_score.squeeze() > 0.5]) # Example threshold
-             # memory_signal = models["memory"].query_memory(combined_features) # [B, memory_dim]
-             risk_score = torch.rand(len(batch_prompts), 1).to(device) * 0.8 # Dummy risk
-             print("Calculated risk and memory signal (Placeholder).")
+        latents_shape = (current_batch_size, unet.config.in_channels, height // vae_scale_factor, width // vae_scale_factor)
+        if generator is not None:
+            latents = torch.randn(latents_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
+        else:
+            latents = torch.randn(latents_shape, device=device, dtype=text_embeddings.dtype)
+        latents = latents * scheduler.init_noise_sigma
 
+        current_risk_score = None
+        if args.enable_privacy and pdu:
+            risk_score_batch, _ = pdu(batch_prompts) 
+            current_risk_score = risk_score_batch.to(device)
+            print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
 
-        # 2. Prepare initial noise (latents)
-        # latents = torch.randn((len(batch_prompts), unet.config.in_channels, height // 8, width // 8)).to(device)
-        # latents = latents * models["scheduler"].init_noise_sigma
+        scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = scheduler.timesteps
 
-        # 3. Diffusion Loop
-        # num_inference_steps = 50
-        # models["scheduler"].set_timesteps(num_inference_steps)
-        # timesteps = models["scheduler"].timesteps
-        # for t in tqdm(timesteps, leave=False):
-        #     latent_model_input = torch.cat([latents] * 2) # For classifier-free guidance
-        #     latent_model_input = models["scheduler"].scale_model_input(latent_model_input, t)
+        for t_idx, t in enumerate(tqdm(timesteps, leave=False, desc="Denoising Steps")):
+            latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
+            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
-        #     noise_pred = models["unet"](latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-        #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        #     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
-        #     latents = models["scheduler"].step(noise_pred, t, latents).prev_sample
+            if guidance_scale > 1.0:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            
+            prev_latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-        #     # --- Apply SEU Perturbation (if enabled) ---
-        #     if args.enable_privacy and models["seu"] is not None and risk_score is not None:
-        #         # Adjust risk_score/memory_signal shape if needed
-        #         # Pass the current timestep 't' correctly
-        #         current_t = t.unsqueeze(0).expand(len(batch_prompts)).to(device) # Example way to get timestep tensor
-        #         latents = models["seu"](latents, current_t, risk_score, memory_signal)
-        #         print(f"Applied SEU at timestep {t.item()} (Placeholder).")
+            if args.enable_privacy and seu and current_risk_score is not None:
+                latents = seu(prev_latents, t, current_risk_score, memory_signal=None)
+                # Optional: log if SEU is applied, e.g., for high risk prompts
+                # if t_idx == 0 and current_risk_score.max() > 0.5:
+                #     print(f"    SEU applied for batch {i+1} due to high risk.")
+            else:
+                latents = prev_latents
 
+        latents = 1 / 0.18215 * latents 
+        image = vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image_np = image.cpu().permute(0, 2, 3, 1).numpy()
+        
+        for img_np_single in image_np:
+            pil_img = Image.fromarray((img_np_single * 255).astype(np.uint8))
+            generated_images_pil.append(pil_img)
+        
+    print(f"Total generated images: {len(generated_images_pil)}")
+    return generated_images_pil
 
-        # 4. Decode latents
-        # latents = 1 / models["vae"].config.scaling_factor * latents
-        # images = models["vae"].decode(latents).sample
-        # images = (images / 2 + 0.5).clamp(0, 1) # Map to [0, 1]
+def calculate_fid(generated_images_pil, reference_path, models, args):
+    if not args.calculate_fid:
+        # print("FID calculation skipped by args.")
+        return float('nan')
+    if not reference_path or not os.path.exists(reference_path):
+        print(f"Reference FID path {reference_path} not found. Skipping FID.")
+        return float('nan')
+    print("Calculating FID (Placeholder)...")
+    return 50.0 
 
-        # Dummy image generation
-        images = torch.rand(len(batch_prompts), 3, 64, 64).to(device) # B, C, H, W
-
-        # Convert to PIL images
-        images_pil = []
-        images_np = images.cpu().permute(0, 2, 3, 1).numpy() # B, H, W, C
-        for img_np in images_np:
-            images_pil.append(Image.fromarray((img_np * 255).astype(np.uint8)))
-        generated_images.extend(images_pil)
-        print(f"Generated batch {i+1}/{num_batches}")
-
-    return generated_images
-
-def calculate_fid(generated_images, reference_path, models, args):
-    """Calculates FID score."""
-    print("Calculating FID...")
-    # device = models["device"]
-    # fid_metric = models["fid_metric"]
-
-    # # Update metric with real images
-    # print("Processing reference images for FID...")
-    # for img_file in tqdm(os.listdir(reference_path)):
-    #     try:
-    #         img = Image.open(os.path.join(reference_path, img_file)).convert("RGB")
-    #         img_tensor = torch.tensor(np.array(img)).permute(2, 0, 1).unsqueeze(0) / 255.0 # (1, C, H, W)
-    #         fid_metric.update(img_tensor.to(device), real=True)
-    #     except Exception as e:
-    #         print(f"Warning: Skipping file {img_file} due to error: {e}")
-
-    # # Update metric with generated images
-    # print("Processing generated images for FID...")
-    # for img in tqdm(generated_images):
-    #      img_tensor = torch.tensor(np.array(img)).permute(2, 0, 1).unsqueeze(0) / 255.0 # (1, C, H, W)
-    #      fid_metric.update(img_tensor.to(device), real=False)
-
-    # fid_score = fid_metric.compute()
-    # print(f"FID Score: {fid_score.item()}")
-    fid_score = 50.0 # Dummy value
-    print(f"FID Score (Placeholder): {fid_score}")
-    return fid_score
-
-def calculate_sli(generated_images, prompts, sensitive_flags, sensitive_keywords, models, args):
-    """Calculates Semantic Leakage Index (SLI)."""
-    print("Calculating SLI...")
-    # device = models["device"]
-    # clip_model = models["clip_model"]
-    # clip_processor = models["clip_processor"]
-
-    sensitive_image_indices = [i for i, flag in enumerate(sensitive_flags) if flag]
-    if not sensitive_image_indices:
-        print("No sensitive prompts found for SLI calculation.")
-        return 0.0
-
-    total_similarity = 0.0
-    count = 0
-
-    # Only evaluate on prompts flagged as sensitive OR containing keywords
-    print(f"Evaluating SLI on {len(sensitive_image_indices)} flagged prompts...")
-    for idx in tqdm(sensitive_image_indices, desc="Calculating SLI"):
-        prompt = prompts[idx]
-        image = generated_images[idx]
-
-        # Determine if prompt is actually sensitive (e.g., contains keywords)
-        is_truly_sensitive = any(keyword.lower() in prompt.lower() for keyword in sensitive_keywords)
-        if not is_truly_sensitive and not sensitive_flags[idx]: # Skip if not flagged and no keywords
-             continue
-
-        # # Process with CLIP
-        # inputs = clip_processor(text=[prompt], images=image, return_tensors="pt", padding=True).to(device)
-        # outputs = clip_model(**inputs)
-        # logits_per_image = outputs.logits_per_image # this is the image-text similarity score
-        # similarity = logits_per_image.item() / 100.0 # Scale? CLIP outputs are often scaled by temp=100
-
-        similarity = np.random.rand() * 0.5 # Dummy similarity
-        total_similarity += similarity
-        count += 1
-
-    sli_score = (total_similarity / count) if count > 0 else 0.0
-    print(f"Average Similarity (SLI Placeholder): {sli_score}")
-    return sli_score
-
+def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keywords, models, args):
+    if not args.calculate_sli:
+        # print("SLI calculation skipped by args.")
+        return float('nan')
+    print("Calculating SLI (Placeholder)...")
+    return 0.1
 
 def save_results(results, args):
     """Saves results and generated images."""
     os.makedirs(args.output_dir, exist_ok=True)
-    results_path = os.path.join(args.output_dir, "results.txt")
-    with open(results_path, "w") as f:
-        for key, value in results.items():
-            f.write(f"{key}: {value}
-")
-    print(f"Results saved to {results_path}")
+    results_path = os.path.join(args.output_dir, "results.json")
+    import json
+    try:
+        serializable_config = {k: str(v) if isinstance(v, pathlib.Path) else v for k, v in results["config"].items()}
+        results_to_save = results.copy()
+        results_to_save["config"] = serializable_config
+        if "generated_images" in results_to_save: 
+            del results_to_save["generated_images"]
 
-    # Save some sample images
+        with open(results_path, "w") as f:
+            json.dump(results_to_save, f, indent=4)
+        print(f"Results saved to {results_path}")
+    except Exception as e:
+        print(f"Error saving results to JSON: {e}. Saving as TXT instead.")
+        results_path_txt = os.path.join(args.output_dir, "results.txt")
+        with open(results_path_txt, "w") as f:
+            for key, value in results.items():
+                if key == "generated_images": continue 
+                f.write(f"{key}: {value}\n")
+        print(f"Results saved to {results_path_txt}")
+
     img_save_dir = os.path.join(args.output_dir, "images")
     os.makedirs(img_save_dir, exist_ok=True)
-    num_save = min(len(results.get("generated_images", [])), 16) # Save first 16 images
-    for i in range(num_save):
-        img = results["generated_images"][i]
-        img.save(os.path.join(img_save_dir, f"sample_{i:03d}.png"))
-    print(f"Saved {num_save} sample images to {img_save_dir}")
+    images_pil_list = results.get("generated_images", [])
+    num_save = min(len(images_pil_list), 16) 
+    saved_paths = []
+    if images_pil_list:
+        for i in range(num_save):
+            img = images_pil_list[i]
+            if isinstance(img, Image.Image):
+                try:
+                    img_path = os.path.join(img_save_dir, f"sample_{i:03d}_{args.seed if args.seed else 'nseed'}_{('priv' if args.enable_privacy else 'nopriv')}.png")
+                    img.save(img_path)
+                    saved_paths.append(img_path)
+                except Exception as e:
+                    print(f"Error saving image sample_{i:03d}.png: {e}")
+            else:
+                print(f"Skipping saving image {i} as it is not a PIL Image object.")
+        if saved_paths:
+            print(f"Saved {len(saved_paths)} sample images to {img_save_dir}")
+    results["generated_images_pil_paths"] = saved_paths
 
 
 def main():
+    # Set an environment variable to signal parse_args to use an empty list for sys.argv
+    # This allows running the script directly with hardcoded defaults without needing CLI args.
+    os.environ["RUNNING_AS_MAIN_SCRIPT_FOR_HARCODING"] = "1" 
     args = parse_args()
-    print("Starting validation...")
-    print(f"Arguments: {args}")
+    del os.environ["RUNNING_AS_MAIN_SCRIPT_FOR_HARCODING"] # Clean up env var
 
-    # 1. Load models
+    # --- Hardcode settings for a basic text-to-image run --- 
+    args.dataset_path = "internal_test_prompts" # Ensure internal prompts are used
+    args.enable_privacy = False # Disable privacy for the most basic run
+    args.calculate_fid = False
+    args.calculate_sli = False
+    # args.image_size = 256 # Already defaulted smaller in parse_args for quick test
+    # args.num_inference_steps = 20 # Already defaulted fewer in parse_args
+    # args.output_dir = "./validation_output_hardcoded_basic" # Can override if needed
+    # args.seed = 42 # Already defaulted
+    # --- End of hardcoded settings ---
+
+    print("Starting validation with hardcoded basic settings...")
+    print(f"Effective Arguments: {vars(args)}")
+
     models = load_models(args)
+    prompts, sensitive_flags, sli_keywords = load_dataset(args)
+    
+    generated_images_pil_list = generate_images(prompts, models, args)
 
-    # 2. Load data
-    prompts, sensitive_flags, sensitive_keywords = load_dataset(args)
+    fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models, args)
+    sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models, args)
 
-    # 3. Generate images
-    # Make sure prompts list length matches num_samples or adjust slicing
-    prompts_to_generate = prompts[:args.num_samples]
-    generated_images = generate_images(prompts_to_generate, models, args)
-
-    # 4. Calculate metrics
-    fid_score = calculate_fid(generated_images, args.reference_fid_path, models, args)
-    sli_score = calculate_sli(generated_images, prompts_to_generate, sensitive_flags[:args.num_samples], sensitive_keywords, models, args)
-    # Add ARD calculation if implemented
-
-    # 5. Report and save results
     results = {
         "config": vars(args),
         "fid": fid_score,
         "sli": sli_score,
-        # "ard": ard_score,
-        "generated_images": generated_images # Keep images for saving samples
+        "generated_images": generated_images_pil_list 
     }
 
     print("\n--- Validation Results ---")
-    print(f"FID: {fid_score:.4f}")
-    print(f"SLI: {sli_score:.4f}")
+    print(f"FID: {fid_score if not np.isnan(fid_score) else 'N/A'}")
+    print(f"SLI: {sli_score if not np.isnan(sli_score) else 'N/A'}")
     print("------------------------")
 
     save_results(results, args)
