@@ -9,24 +9,24 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 from PIL import Image # 用于处理图像输出
 
 # TODO List:
-# - 将以下模块集成到一个完整的扩散模型框架 (例如 UNet + VAE + Scheduler) 中
+# - [DONE] 将以下模块集成到一个完整的扩散模型框架 (例如 UNet + VAE + Scheduler) 中
 # - 实现 Langevin Dynamics 驱动的可微分隐私引擎
-# - 实现 Apoptosis (注意力自毁), Epigenetic Regulation (提示词加密), Quorum Quenching (分布式)
+# - [PARTIALLY DONE / PLACEHOLDER] 实现 Apoptosis (注意力自毁), Epigenetic Regulation (提示词加密), Quorum Quenching (分布式)
 # - 实现 SLI, ARD 等评估指标
 # - PrivacyEnhancementUnit: 替换为更复杂的、基于Langevin Dynamics的噪声生成或潜在空间扰动机制
 # - PrivacyEnhancementUnit.forward: 结合 memory_signal 实现更复杂的潜在空间扰动
-# - PrivacyEnhancementUnit.shm_update: 改进此机制
+# - PrivacyEnhancementUnit.shm_update: 改进此机制 (Note: shm_update was removed in simplified version)
 # - PrivacyDetectionUnit.forward: 可以使用更复杂的图池化方法
-# - ImmuneMemoryModule: 确认 B 的初始化策略是否需要调整
-# - ImmuneMemoryModule.update_memory: 考虑更复杂的合并策略
-# - ImmuneMemoryModule.update_memory: 限制记忆库大小 (例如 FIFO 或基于重要性采样)
-# - ImmuneMemoryModule.query_memory: 定义如何使用查询结果，例如返回最相似的记忆向量或加权平均等
-# - ApoptosisMechanism: 实现检测高风险/攻击并禁用模型部分（如UNet中的Attention层）的逻辑
-# - epigenetic_prompt_encoding: 实现鲁棒的提示词编码/加密机制
+# - [DONE] ImmuneMemoryModule: 确认 B 的初始化策略是否需要调整
+# - [DONE] ImmuneMemoryModule.update_memory: 考虑更复杂的合并策略
+# - [DONE] ImmuneMemoryModule.update_memory: 限制记忆库大小 (例如 FIFO 或基于重要性采样)
+# - [DONE] ImmuneMemoryModule.query_memory: 定义如何使用查询结果，例如返回最相似的记忆向量或加权平均等
+# - [PARTIALLY DONE / PLACEHOLDER] ApoptosisMechanism: 实现检测高风险/攻击并禁用模型部分（如UNet中的Attention层）的逻辑
+# - [PARTIALLY DONE / PLACEHOLDER] epigenetic_prompt_encoding: 实现鲁棒的提示词编码/加密机制
 # - ImmunoDiffusionModel: Add epigenetic prompt handling if needed
-# - ImmunoDiffusionModel.forward: 实现完整的扩散循环，集成PDU, SEU, Memory, Apoptosis
-# - ImmunoDiffusionModel.forward: 确保所有组件的输入输出维度匹配
-# - ImmunoDiffusionModel.forward: 添加对 device (cuda/cpu) 的处理
+# - [DONE] ImmunoDiffusionModel.forward: 实现完整的扩散循环，集成PDU, SEU, Memory, Apoptosis
+# - [DONE] ImmunoDiffusionModel.forward: 确保所有组件的输入输出维度匹配
+# - [DONE] ImmunoDiffusionModel.forward: 添加对 device (cuda/cpu) 的处理
 
 class PrivacyEnhancementUnit(nn.Module):
     """
