@@ -13,6 +13,13 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, EulerDiscreteSchedule
 # from diffusers.utils import randn_tensor # -> Replaced with torch.randn
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# Try to import torchvision, needed for FID. Fail gracefully if not available.
+try:
+    from torchvision import models as torchvision_models, transforms as torchvision_transforms
+except ImportError:
+    print("Warning: torchvision not found. FID calculation will be skipped if attempted.")
+    torchvision_models, torchvision_transforms = None, None # Make them None so checks fail later
+
 # 导入简化的PDU和SEU
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit 
 
@@ -213,6 +220,7 @@ def generate_images(prompts, models, args):
         if device == "cuda": torch.cuda.manual_seed_all(args.seed)
 
     generated_images_pil = []
+    all_batch_risk_scores = [] # To collect PDU risk scores
     num_batches = (len(prompts) + batch_size - 1) // batch_size
 
     for i in tqdm(range(num_batches), desc="Generating Batches"):
@@ -239,6 +247,7 @@ def generate_images(prompts, models, args):
         if args.enable_privacy and pdu:
             risk_score_batch, _ = pdu(batch_prompts) 
             current_risk_score = risk_score_batch.to(device)
+            all_batch_risk_scores.append(current_risk_score.detach().cpu().numpy()) # Collect scores
             print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
 
         scheduler.set_timesteps(num_inference_steps, device=device)
@@ -274,24 +283,247 @@ def generate_images(prompts, models, args):
             generated_images_pil.append(pil_img)
         
     print(f"Total generated images: {len(generated_images_pil)}")
-    return generated_images_pil
+    final_risk_scores = np.concatenate(all_batch_risk_scores) if all_batch_risk_scores else np.array([])
+    return generated_images_pil, final_risk_scores
 
-def calculate_fid(generated_images_pil, reference_path, models, args):
+# --- FID Calculation Functions ---
+def get_inception_model_for_fid(device):
+    """Loads the InceptionV3 model for FID calculation."""
+    if torchvision_models is None:
+        raise ImportError("torchvision.models is not available.")
+    inception_model = torchvision_models.inception_v3(weights=torchvision_models.Inception_V3_Weights.DEFAULT, transform_input=False).to(device)
+    inception_model.fc = torch.nn.Identity() # Use identity to get features
+    inception_model.eval()
+    return inception_model
+
+def preprocess_image_for_fid(img_pil, device):
+    """Preprocesses a PIL image for InceptionV3."""
+    if torchvision_transforms is None:
+        raise ImportError("torchvision.transforms is not available.")
+    
+    # Standard InceptionV3 preprocessing
+    transform = torchvision_transforms.Compose([
+        torchvision_transforms.Resize(299),
+        torchvision_transforms.CenterCrop(299),
+        torchvision_transforms.ToTensor(),
+        torchvision_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    if img_pil.mode != 'RGB':
+        img_pil = img_pil.convert('RGB')
+    return transform(img_pil).unsqueeze(0).to(device)
+
+def get_activations_for_fid(image_list_pil, model, batch_size, device):
+    """Calculates InceptionV3 activations for a list of PIL images."""
+    if not image_list_pil:
+        return np.empty((0, 2048)) # InceptionV3 feature dimension
+
+    num_batches = (len(image_list_pil) + batch_size - 1) // batch_size
+    pred_arr = []
+
+    for i in tqdm(range(num_batches), desc="Calculating Inception Activations"):
+        batch_pil_images = image_list_pil[i * batch_size : (i + 1) * batch_size]
+        if not batch_pil_images:
+            continue
+
+        batch_tensor = torch.cat([preprocess_image_for_fid(img, device) for img in batch_pil_images], dim=0)
+        
+        with torch.no_grad():
+            pred = model(batch_tensor)
+
+        if isinstance(pred, tuple): # InceptionV3 in training mode might return tuple
+            pred = pred[0]
+        
+        pred_arr.append(pred.cpu().numpy().reshape(pred.size(0), -1))
+
+    return np.concatenate(pred_arr, axis=0)
+
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Numpy implementation of the Frechet Distance using torch.linalg.sqrtm."""
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+
+    assert mu1.shape == mu2.shape, 'Mean vectors have different lengths'
+    assert sigma1.shape == sigma2.shape, 'Covariance matrices have different dimensions'
+
+    diff = mu1 - mu2
+
+    # Convert numpy arrays to torch tensors for sqrtm
+    # Ensure they are float64 for precision, and then potentially complex for sqrtm
+    sigma1_torch = torch.from_numpy(sigma1).to(dtype=torch.complex128 if sigma1.dtype != np.complex128 else sigma1.dtype)
+    sigma2_torch = torch.from_numpy(sigma2).to(dtype=torch.complex128 if sigma2.dtype != np.complex128 else sigma2.dtype)
+    
+    # Calculate (sigma1 @ sigma2)
+    covmean_matrix_prod = sigma1_torch @ sigma2_torch
+    
+    # Calculate sqrt of the product of covariance matrices
+    # torch.linalg.sqrtm can handle non-symmetric matrices and return complex results
+    try:
+        sqrt_covmean_matrix_prod = torch.linalg.sqrtm(covmean_matrix_prod)
+    except Exception as e:
+        print(f"torch.linalg.sqrtm failed: {e}. Using pseudo-inverse if applicable or failing.")
+        # Fallback or error, FID might be unstable or NaN.
+        # For now, re-raise or return NaN to indicate failure.
+        # A more robust solution might involve checking condition numbers or using pseudo-sqrt.
+        # However, a common cause is non-positive semi-definite product, often due to small sample sizes.
+        raise ValueError(f"Matrix square root computation failed: {e}")
+
+
+    # If the result is complex, take the real part if imaginary part is small
+    if torch.is_complex(sqrt_covmean_matrix_prod):
+        if torch.max(torch.abs(sqrt_covmean_matrix_prod.imag)) > 1e-3: # Tolerance
+            print(f"Warning: Complex result from sqrtm with significant imaginary part ({torch.max(torch.abs(sqrt_covmean_matrix_prod.imag)):.2e}). FID might be unstable.")
+        sqrt_covmean_matrix_prod = sqrt_covmean_matrix_prod.real # Take real part
+
+    sqrt_covmean = sqrt_covmean_matrix_prod.numpy().astype(np.float64)
+    
+    tr_covmean = np.trace(sqrt_covmean)
+    fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+    return fid
+
+def calculate_fid(generated_images_pil, reference_path, models_dict, args):
     if not args.calculate_fid:
-        # print("FID calculation skipped by args.")
         return float('nan')
+    
+    if torchvision_models is None or torchvision_transforms is None:
+        print("torchvision.models or torchvision.transforms could not be imported. FID calculation skipped.")
+        return float('nan')
+
     if not reference_path or not os.path.exists(reference_path):
         print(f"Reference FID path {reference_path} not found. Skipping FID.")
         return float('nan')
-    print("Calculating FID (Placeholder)...")
-    return 50.0 
-
-def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keywords, models, args):
-    if not args.calculate_sli:
-        # print("SLI calculation skipped by args.")
+    
+    print("Calculating FID...")
+    device = models_dict["device"]
+    
+    try:
+        inception_model = get_inception_model_for_fid(device)
+    except Exception as e:
+        print(f"Could not load InceptionV3 model for FID: {e}. Skipping FID.")
+        print("Make sure torchvision is installed and can download pretrained models (check internet/HF_ENDPOINT).")
         return float('nan')
-    print("Calculating SLI (Placeholder)...")
-    return 0.1
+
+    # Load reference images
+    ref_image_paths = [os.path.join(reference_path, f) for f in os.listdir(reference_path) 
+                       if os.path.isfile(os.path.join(reference_path, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
+    if not ref_image_paths:
+        print(f"No reference images found in {reference_path}. Skipping FID.")
+        return float('nan')
+        
+    ref_images_pil = []
+    for p in tqdm(ref_image_paths, desc="Loading reference FID images"):
+        try:
+            img = Image.open(p).convert('RGB')
+            ref_images_pil.append(img)
+        except Exception as e:
+            print(f"Warning: Could not load reference image {p}: {e}")
+    
+    if not ref_images_pil:
+        print(f"Failed to load any reference images. Skipping FID.")
+        return float('nan')
+    
+    if not generated_images_pil:
+        print("No generated images to calculate FID for. Skipping FID.")
+        return float('nan')
+
+    print(f"Calculating FID with {len(generated_images_pil)} generated images and {len(ref_images_pil)} reference images.")
+
+    fid_batch_size = min(32, args.batch_size * 2 if hasattr(args, 'batch_size') else 32) # Make it robust
+    
+    try:
+        act_generated = get_activations_for_fid(generated_images_pil, inception_model, fid_batch_size, device)
+        act_reference = get_activations_for_fid(ref_images_pil, inception_model, fid_batch_size, device)
+    except Exception as e:
+        print(f"Error getting activations for FID: {e}. Skipping FID.")
+        return float('nan')
+
+    if act_generated.shape[0] < 2 or act_reference.shape[0] < 2: # Need at least 2 samples to compute covariance
+        print(f"Not enough activations to compute FID (generated: {act_generated.shape[0]}, reference: {act_reference.shape[0]}). Need at least 2 for each. Skipping FID.")
+        return float('nan')
+        
+    mu_gen, sigma_gen = np.mean(act_generated, axis=0), np.cov(act_generated, rowvar=False)
+    mu_ref, sigma_ref = np.mean(act_reference, axis=0), np.cov(act_reference, rowvar=False)
+    
+    # Add epsilon to diagonal of covariances for stability if they are singular
+    # This is a common practice if sample size is small relative to feature dimension
+    epsilon = eps=1e-6
+    sigma_gen += np.eye(sigma_gen.shape[0]) * epsilon
+    sigma_ref += np.eye(sigma_ref.shape[0]) * epsilon
+
+    try:
+        fid_value = calculate_frechet_distance(mu_gen, sigma_gen, mu_ref, sigma_ref)
+    except ValueError as e:
+        print(f"Error calculating Frechet distance: {e}. This can happen with ill-conditioned covariance matrices (e.g. too few samples). Skipping FID.")
+        return float('nan')
+    except Exception as e:
+        print(f"Unexpected error calculating Frechet distance: {e}. Skipping FID.")
+        return float('nan')
+        
+    print(f"Calculated FID: {fid_value:.4f}")
+    return float(fid_value)
+
+def calculate_sli(generated_images_pil, prompts, sensitive_flags, sli_sensitive_keywords, models_dict, args):
+    if not args.calculate_sli:
+        return float('nan')
+    
+    if not sli_sensitive_keywords:
+        print("SLI calculation active, but no SLI sensitive keywords provided. SLI will be 0 or NaN.")
+        return 0.0 
+
+    print(f"Calculating SLI with {len(sli_sensitive_keywords)} keywords (showing up to 5): {sli_sensitive_keywords[:5]}...")
+    
+    num_prompts_with_keywords = 0
+    # This simple SLI counts how many sensitive prompts resulted in an image.
+    # It doesn't analyze image content for actual leakage.
+    num_sensitive_prompts_with_successful_generation = 0 
+
+    if len(prompts) != len(generated_images_pil) and args.dataset_path == "internal_test_prompts":
+         # This conditionality might be too specific for "internal_test_prompts"
+         # A general warning is better if counts don't match for any reason
+        print(f"Warning: Number of prompts ({len(prompts)}) and generated images ({len(generated_images_pil)}) mismatch. SLI might be based on fewer pairs than expected.")
+    
+    # Iterate up to the minimum length of prompts or generated images to avoid index errors
+    num_comparisons = min(len(prompts), len(generated_images_pil))
+
+    for i in range(num_comparisons):
+        prompt_text = prompts[i]
+        prompt_lower = prompt_text.lower()
+        is_sensitive_prompt = False
+        for keyword in sli_sensitive_keywords:
+            if keyword.lower() in prompt_lower:
+                is_sensitive_prompt = True
+                break
+        
+        if is_sensitive_prompt:
+            num_prompts_with_keywords += 1
+            # Check if an image was actually generated for this sensitive prompt
+            if generated_images_pil[i] is not None: # Assuming None if generation failed for a specific prompt
+                 num_sensitive_prompts_with_successful_generation +=1
+
+    if num_prompts_with_keywords == 0:
+        print("No prompts contained SLI sensitive keywords after checking available pairs. SLI is 0 or N/A.")
+        return 0.0 
+
+    sli_score = num_sensitive_prompts_with_successful_generation / num_prompts_with_keywords
+    print(f"SLI: {num_sensitive_prompts_with_successful_generation} successful generations for {num_prompts_with_keywords} sensitive prompts. SLI = {sli_score:.4f}")
+    return float(sli_score)
+
+def calculate_ard(all_risk_scores, args):
+    """Calculates Average Risk Detection (ARD) based on PDU scores."""
+    if not args.enable_privacy:
+        print("ARD: Privacy not enabled, PDU risk scores not applicable.")
+        return float('nan')
+    
+    if all_risk_scores is None or all_risk_scores.size == 0:
+        if args.enable_privacy:
+             print("ARD: Privacy enabled, but no PDU risk scores were collected (PDU might be misconfigured or no prompts processed).")
+        return float('nan')
+    
+    # all_risk_scores should be a flat numpy array of scores for each item processed by PDU.
+    average_risk = np.mean(all_risk_scores)
+    print(f"Calculating ARD (Average PDU Risk Score over {all_risk_scores.size} items): {average_risk:.4f}")
+    return float(average_risk)
 
 def save_results(results, args):
     """Saves results and generated images."""
@@ -349,8 +581,8 @@ def main():
     # --- Hardcode settings for a basic text-to-image run --- 
     args.dataset_path = "internal_test_prompts" # Ensure internal prompts are used
     args.enable_privacy = False # Disable privacy for the most basic run
-    args.calculate_fid = False
-    args.calculate_sli = False
+    args.calculate_fid = False # Keep FID off for basic hardcoded run by default, can be overridden by CLI
+    args.calculate_sli = False # Keep SLI off for basic hardcoded run
     # args.image_size = 256 # Already defaulted smaller in parse_args for quick test
     # args.num_inference_steps = 20 # Already defaulted fewer in parse_args
     # args.output_dir = "./validation_output_hardcoded_basic" # Can override if needed
@@ -360,24 +592,28 @@ def main():
     print("Starting validation with hardcoded basic settings...")
     print(f"Effective Arguments: {vars(args)}")
 
-    models = load_models(args)
+    models_dict = load_models(args) # Renamed to models_dict to avoid conflict if 'models' is imported from torchvision
     prompts, sensitive_flags, sli_keywords = load_dataset(args)
     
-    generated_images_pil_list = generate_images(prompts, models, args)
+    generated_images_pil_list, all_risk_scores = generate_images(prompts, models_dict, args)
 
-    fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models, args)
-    sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models, args)
+    fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models_dict, args)
+    sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models_dict, args)
+    ard_score = calculate_ard(all_risk_scores, args)
+
 
     results = {
         "config": vars(args),
         "fid": fid_score,
         "sli": sli_score,
+        "ard": ard_score, 
         "generated_images": generated_images_pil_list 
     }
 
     print("\n--- Validation Results ---")
     print(f"FID: {fid_score if not np.isnan(fid_score) else 'N/A'}")
     print(f"SLI: {sli_score if not np.isnan(sli_score) else 'N/A'}")
+    print(f"ARD: {ard_score if not np.isnan(ard_score) else 'N/A'}")
     print("------------------------")
 
     save_results(results, args)
