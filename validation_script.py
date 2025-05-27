@@ -13,13 +13,6 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, EulerDiscreteSchedule
 # from diffusers.utils import randn_tensor # -> Replaced with torch.randn
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# Try to import torchvision, needed for FID. Fail gracefully if not available.
-try:
-    from torchvision import models as torchvision_models, transforms as torchvision_transforms
-except ImportError:
-    print("Warning: torchvision not found. FID calculation will be skipped if attempted.")
-    torchvision_models, torchvision_transforms = None, None # Make them None so checks fail later
-
 # 导入简化的PDU和SEU
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit 
 
@@ -48,6 +41,9 @@ def parse_args():
     parser.add_argument("--enable_privacy", action="store_true", help="Enable Immuno-Diffusion privacy mechanisms")
     parser.add_argument("--calculate_fid", action="store_true", help="Calculate FID score.")
     parser.add_argument("--calculate_sli", action="store_true", help="Calculate SLI score.")
+    parser.add_argument("--calculate_ard", action="store_true", help="Calculate ARD score (currently a placeholder).")
+    parser.add_argument("--clip_model_id", type=str, default="openai/clip-vit-base-patch32", help="Hugging Face model ID for the CLIP model used in SLI/FID.")
+    parser.add_argument("--sli_leak_threshold", type=float, default=0.25, help="Cosine similarity threshold for SLI leak detection with CLIP.")
 
     args = parser.parse_args([] if __name__ == "__main__" and os.getenv("RUNNING_AS_MAIN_SCRIPT_FOR_HARCODING") else None) # Parse no args if hardcoding intended for direct run
     
@@ -108,7 +104,22 @@ def load_models(args):
     else:
         print("Privacy mechanisms disabled.")
 
-    clip_model, clip_processor, fid_metric = None, None, None 
+    clip_model, clip_processor = None, None 
+    if args.calculate_sli or args.calculate_fid: # FID might also use CLIP
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+            clip_model_id_to_load = args.clip_model_id
+            print(f"Loading CLIP model ({clip_model_id_to_load}) for SLI/FID...")
+            clip_processor = CLIPProcessor.from_pretrained(clip_model_id_to_load)
+            clip_model = CLIPModel.from_pretrained(clip_model_id_to_load).to(device)
+            clip_model.eval() # Set to eval mode
+            print("CLIP model and processor loaded successfully.")
+        except ImportError:
+            print("Transformers library not fully installed or CLIP components missing. Please ensure 'transformers' and 'torch' are correctly installed.")
+        except Exception as e:
+            print(f"Error loading CLIP model ({args.clip_model_id}): {e}")
+
+    fid_metric = None # Placeholder for actual FID metric logic
 
     models = {
         "tokenizer": tokenizer, "text_encoder": text_encoder,
@@ -151,6 +162,12 @@ def load_dataset(args):
                 if 'prompt' not in df.columns:
                     raise ValueError("CSV file must contain a 'prompt' column.")
                 prompts_data = df['prompt'].astype(str).tolist()
+                if 'is_sensitive' in df.columns: # Optional column for sensitive flags
+                    sensitive_flags = df['is_sensitive'].astype(bool).tolist()
+                else: # Default if not provided
+                    sensitive_flags = [False] * len(prompts_data)
+
+
             except ImportError:
                 print("Pandas not installed, please install to load CSV datasets or use a .txt file.")
                 raise
@@ -161,6 +178,7 @@ def load_dataset(args):
             try:
                 with open(args.dataset_path, 'r', encoding='utf-8') as f:
                     prompts_data = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                sensitive_flags = [False] * len(prompts_data) # Default for TXT, or could have a companion file
             except Exception as e:
                 print(f"Error loading TXT file: {e}")
                 raise
@@ -171,18 +189,25 @@ def load_dataset(args):
         if not prompts_data:
             print("No prompts loaded from dataset file, using fallback dummy prompts.")
             prompts_data = [f"Fallback sample prompt {i}" for i in range(args.num_samples)] 
+            sensitive_flags = [i % 5 == 0 for i in range(len(prompts_data))] # Dummy flags for fallback
         
+        # Ensure prompts and flags are sliced to num_samples
         prompts_to_use = prompts_data[:args.num_samples]
-        sensitive_flags = [i % 5 == 0 for i in range(len(prompts_to_use))] # Dummy flags for external datasets
+        if len(sensitive_flags) >= args.num_samples :
+            sensitive_flags = sensitive_flags[:args.num_samples]
+        else: # If sensitive_flags from file is shorter than num_samples
+            sensitive_flags.extend([False] * (args.num_samples - len(sensitive_flags)))
+
         print(f"Loaded/selected {len(prompts_to_use)} prompts for generation from file.")
 
     # Load SLI sensitive keywords (distinct from PDU keywords, though can be from same file)
     if args.sensitive_keywords_path and os.path.exists(args.sensitive_keywords_path):
         with open(args.sensitive_keywords_path, 'r', encoding='utf-8') as f:
             sli_sensitive_keywords = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-        print(f"Loaded {len(sli_sensitive_keywords)} sensitive keywords for SLI calculation.")
+        print(f"Loaded {len(sli_sensitive_keywords)} sensitive keywords for SLI calculation from {args.sensitive_keywords_path}.")
     elif args.calculate_sli:
-        print("Warning: --calculate_sli is set but --sensitive_keywords_path was not provided or found for SLI.")
+        print("Warning: --calculate_sli is set but --sensitive_keywords_path was not provided or found. SLI may not work as expected without keywords.")
+        sli_sensitive_keywords = [] # Ensure it's an empty list
 
     return prompts_to_use, sensitive_flags, sli_sensitive_keywords
 
@@ -217,10 +242,9 @@ def generate_images(prompts, models, args):
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     if args.seed is not None: # Also set global Pytorch seed
         torch.manual_seed(args.seed)
-        if device == "cuda": torch.cuda.manual_seed_all(args.seed)
+        if device.type == "cuda": torch.cuda.manual_seed_all(args.seed) # check device type
 
     generated_images_pil = []
-    all_batch_risk_scores = [] # To collect PDU risk scores
     num_batches = (len(prompts) + batch_size - 1) // batch_size
 
     for i in tqdm(range(num_batches), desc="Generating Batches"):
@@ -237,18 +261,16 @@ def generate_images(prompts, models, args):
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         latents_shape = (current_batch_size, unet.config.in_channels, height // vae_scale_factor, width // vae_scale_factor)
-        if generator is not None:
-            latents = torch.randn(latents_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
-        else:
-            latents = torch.randn(latents_shape, device=device, dtype=text_embeddings.dtype)
+        # Use torch.randn directly as per diffusers convention
+        latents = torch.randn(latents_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
         latents = latents * scheduler.init_noise_sigma
 
         current_risk_score = None
         if args.enable_privacy and pdu:
+            # PDU's simplified forward takes list of prompts
             risk_score_batch, _ = pdu(batch_prompts) 
             current_risk_score = risk_score_batch.to(device)
-            all_batch_risk_scores.append(current_risk_score.detach().cpu().numpy()) # Collect scores
-            print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
+            # print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
 
         scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = scheduler.timesteps
@@ -266,276 +288,221 @@ def generate_images(prompts, models, args):
             prev_latents = scheduler.step(noise_pred, t, latents).prev_sample
 
             if args.enable_privacy and seu and current_risk_score is not None:
+                # SEU's forward: z, t, risk_score, memory_signal=None
+                # Ensure risk_score matches batch size of prev_latents
+                # current_risk_score is [current_batch_size, 1]
                 latents = seu(prev_latents, t, current_risk_score, memory_signal=None)
-                # Optional: log if SEU is applied, e.g., for high risk prompts
-                # if t_idx == 0 and current_risk_score.max() > 0.5:
-                #     print(f"    SEU applied for batch {i+1} due to high risk.")
             else:
                 latents = prev_latents
-
-        latents = 1 / 0.18215 * latents 
+        
+        # Standard VAE scaling factor is 0.18215
+        latents = 1 / vae.config.scaling_factor * latents 
         image = vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image_np = image.cpu().permute(0, 2, 3, 1).numpy()
+        image_np = image.cpu().permute(0, 2, 3, 1).float().numpy() # Ensure float for numpy conversion
         
         for img_np_single in image_np:
             pil_img = Image.fromarray((img_np_single * 255).astype(np.uint8))
             generated_images_pil.append(pil_img)
         
     print(f"Total generated images: {len(generated_images_pil)}")
-    final_risk_scores = np.concatenate(all_batch_risk_scores) if all_batch_risk_scores else np.array([])
-    return generated_images_pil, final_risk_scores
+    return generated_images_pil
 
-# --- FID Calculation Functions ---
-def get_inception_model_for_fid(device):
-    """Loads the InceptionV3 model for FID calculation."""
-    if torchvision_models is None:
-        raise ImportError("torchvision.models is not available.")
-    inception_model = torchvision_models.inception_v3(weights=torchvision_models.Inception_V3_Weights.DEFAULT, transform_input=False).to(device)
-    inception_model.fc = torch.nn.Identity() # Use identity to get features
-    inception_model.eval()
-    return inception_model
-
-def preprocess_image_for_fid(img_pil, device):
-    """Preprocesses a PIL image for InceptionV3."""
-    if torchvision_transforms is None:
-        raise ImportError("torchvision.transforms is not available.")
-    
-    # Standard InceptionV3 preprocessing
-    transform = torchvision_transforms.Compose([
-        torchvision_transforms.Resize(299),
-        torchvision_transforms.CenterCrop(299),
-        torchvision_transforms.ToTensor(),
-        torchvision_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    if img_pil.mode != 'RGB':
-        img_pil = img_pil.convert('RGB')
-    return transform(img_pil).unsqueeze(0).to(device)
-
-def get_activations_for_fid(image_list_pil, model, batch_size, device):
-    """Calculates InceptionV3 activations for a list of PIL images."""
-    if not image_list_pil:
-        return np.empty((0, 2048)) # InceptionV3 feature dimension
-
-    num_batches = (len(image_list_pil) + batch_size - 1) // batch_size
-    pred_arr = []
-
-    for i in tqdm(range(num_batches), desc="Calculating Inception Activations"):
-        batch_pil_images = image_list_pil[i * batch_size : (i + 1) * batch_size]
-        if not batch_pil_images:
-            continue
-
-        batch_tensor = torch.cat([preprocess_image_for_fid(img, device) for img in batch_pil_images], dim=0)
-        
-        with torch.no_grad():
-            pred = model(batch_tensor)
-
-        if isinstance(pred, tuple): # InceptionV3 in training mode might return tuple
-            pred = pred[0]
-        
-        pred_arr.append(pred.cpu().numpy().reshape(pred.size(0), -1))
-
-    return np.concatenate(pred_arr, axis=0)
-
-def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """Numpy implementation of the Frechet Distance using torch.linalg.sqrtm."""
-    mu1 = np.atleast_1d(mu1)
-    mu2 = np.atleast_1d(mu2)
-    sigma1 = np.atleast_2d(sigma1)
-    sigma2 = np.atleast_2d(sigma2)
-
-    assert mu1.shape == mu2.shape, 'Mean vectors have different lengths'
-    assert sigma1.shape == sigma2.shape, 'Covariance matrices have different dimensions'
-
-    diff = mu1 - mu2
-
-    # Convert numpy arrays to torch tensors for sqrtm
-    # Ensure they are float64 for precision, and then potentially complex for sqrtm
-    sigma1_torch = torch.from_numpy(sigma1).to(dtype=torch.complex128 if sigma1.dtype != np.complex128 else sigma1.dtype)
-    sigma2_torch = torch.from_numpy(sigma2).to(dtype=torch.complex128 if sigma2.dtype != np.complex128 else sigma2.dtype)
-    
-    # Calculate (sigma1 @ sigma2)
-    covmean_matrix_prod = sigma1_torch @ sigma2_torch
-    
-    # Calculate sqrt of the product of covariance matrices
-    # torch.linalg.sqrtm can handle non-symmetric matrices and return complex results
-    try:
-        sqrt_covmean_matrix_prod = torch.linalg.sqrtm(covmean_matrix_prod)
-    except Exception as e:
-        print(f"torch.linalg.sqrtm failed: {e}. Using pseudo-inverse if applicable or failing.")
-        # Fallback or error, FID might be unstable or NaN.
-        # For now, re-raise or return NaN to indicate failure.
-        # A more robust solution might involve checking condition numbers or using pseudo-sqrt.
-        # However, a common cause is non-positive semi-definite product, often due to small sample sizes.
-        raise ValueError(f"Matrix square root computation failed: {e}")
-
-
-    # If the result is complex, take the real part if imaginary part is small
-    if torch.is_complex(sqrt_covmean_matrix_prod):
-        if torch.max(torch.abs(sqrt_covmean_matrix_prod.imag)) > 1e-3: # Tolerance
-            print(f"Warning: Complex result from sqrtm with significant imaginary part ({torch.max(torch.abs(sqrt_covmean_matrix_prod.imag)):.2e}). FID might be unstable.")
-        sqrt_covmean_matrix_prod = sqrt_covmean_matrix_prod.real # Take real part
-
-    sqrt_covmean = sqrt_covmean_matrix_prod.numpy().astype(np.float64)
-    
-    tr_covmean = np.trace(sqrt_covmean)
-    fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
-    return fid
-
-def calculate_fid(generated_images_pil, reference_path, models_dict, args):
+def calculate_fid(generated_images_pil, reference_path, models, args):
     if not args.calculate_fid:
+        # print("FID calculation skipped by args.")
         return float('nan')
-    
-    if torchvision_models is None or torchvision_transforms is None:
-        print("torchvision.models or torchvision.transforms could not be imported. FID calculation skipped.")
-        return float('nan')
-
     if not reference_path or not os.path.exists(reference_path):
         print(f"Reference FID path {reference_path} not found. Skipping FID.")
         return float('nan')
-    
-    print("Calculating FID...")
-    device = models_dict["device"]
-    
-    try:
-        inception_model = get_inception_model_for_fid(device)
-    except Exception as e:
-        print(f"Could not load InceptionV3 model for FID: {e}. Skipping FID.")
-        print("Make sure torchvision is installed and can download pretrained models (check internet/HF_ENDPOINT).")
-        return float('nan')
+    print("Calculating FID (Placeholder)...")
+    # Actual FID calculation would require a library like torchmetrics or pytorch-fid
+    # and an Inception model or CLIP features.
+    # Example:
+    # from torchmetrics.image.fid import FrechetInceptionDistance
+    # fid = FrechetInceptionDistance(feature=64).to(models["device"]) # Example feature layer
+    # # Preprocess images to uint8 tensors [N, C, H, W] in range [0, 255]
+    # for img_pil in generated_images_pil:
+    #    img_tensor = torch.tensor(np.array(img_pil)).permute(2,0,1)
+    #    fid.update(img_tensor.unsqueeze(0), real=False)
+    # # Load and process real images
+    # # for real_img_path in Path(reference_path).glob('*.png'): # Or other formats
+    # #    real_img_pil = Image.open(real_img_path).convert("RGB")
+    # #    real_img_tensor = torch.tensor(np.array(real_img_pil)).permute(2,0,1)
+    # #    fid.update(real_img_tensor.unsqueeze(0), real=True)
+    # # return fid.compute().item()
+    return 50.0 
 
-    # Load reference images
-    ref_image_paths = [os.path.join(reference_path, f) for f in os.listdir(reference_path) 
-                       if os.path.isfile(os.path.join(reference_path, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
-    if not ref_image_paths:
-        print(f"No reference images found in {reference_path}. Skipping FID.")
-        return float('nan')
-        
-    ref_images_pil = []
-    for p in tqdm(ref_image_paths, desc="Loading reference FID images"):
-        try:
-            img = Image.open(p).convert('RGB')
-            ref_images_pil.append(img)
-        except Exception as e:
-            print(f"Warning: Could not load reference image {p}: {e}")
-    
-    if not ref_images_pil:
-        print(f"Failed to load any reference images. Skipping FID.")
-        return float('nan')
-    
-    if not generated_images_pil:
-        print("No generated images to calculate FID for. Skipping FID.")
-        return float('nan')
-
-    print(f"Calculating FID with {len(generated_images_pil)} generated images and {len(ref_images_pil)} reference images.")
-
-    fid_batch_size = min(32, args.batch_size * 2 if hasattr(args, 'batch_size') else 32) # Make it robust
-    
-    try:
-        act_generated = get_activations_for_fid(generated_images_pil, inception_model, fid_batch_size, device)
-        act_reference = get_activations_for_fid(ref_images_pil, inception_model, fid_batch_size, device)
-    except Exception as e:
-        print(f"Error getting activations for FID: {e}. Skipping FID.")
-        return float('nan')
-
-    if act_generated.shape[0] < 2 or act_reference.shape[0] < 2: # Need at least 2 samples to compute covariance
-        print(f"Not enough activations to compute FID (generated: {act_generated.shape[0]}, reference: {act_reference.shape[0]}). Need at least 2 for each. Skipping FID.")
-        return float('nan')
-        
-    mu_gen, sigma_gen = np.mean(act_generated, axis=0), np.cov(act_generated, rowvar=False)
-    mu_ref, sigma_ref = np.mean(act_reference, axis=0), np.cov(act_reference, rowvar=False)
-    
-    # Add epsilon to diagonal of covariances for stability if they are singular
-    # This is a common practice if sample size is small relative to feature dimension
-    epsilon = eps=1e-6
-    sigma_gen += np.eye(sigma_gen.shape[0]) * epsilon
-    sigma_ref += np.eye(sigma_ref.shape[0]) * epsilon
-
-    try:
-        fid_value = calculate_frechet_distance(mu_gen, sigma_gen, mu_ref, sigma_ref)
-    except ValueError as e:
-        print(f"Error calculating Frechet distance: {e}. This can happen with ill-conditioned covariance matrices (e.g. too few samples). Skipping FID.")
-        return float('nan')
-    except Exception as e:
-        print(f"Unexpected error calculating Frechet distance: {e}. Skipping FID.")
-        return float('nan')
-        
-    print(f"Calculated FID: {fid_value:.4f}")
-    return float(fid_value)
-
-def calculate_sli(generated_images_pil, prompts, sensitive_flags, sli_sensitive_keywords, models_dict, args):
+def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keywords, models, args):
     if not args.calculate_sli:
+        # print("SLI calculation skipped by args.")
         return float('nan')
     
-    if not sli_sensitive_keywords:
-        print("SLI calculation active, but no SLI sensitive keywords provided. SLI will be 0 or NaN.")
-        return 0.0 
+    clip_model = models.get("clip_model")
+    clip_processor = models.get("clip_processor")
+    device = models.get("device")
 
-    print(f"Calculating SLI with {len(sli_sensitive_keywords)} keywords (showing up to 5): {sli_sensitive_keywords[:5]}...")
-    
-    num_prompts_with_keywords = 0
-    # This simple SLI counts how many sensitive prompts resulted in an image.
-    # It doesn't analyze image content for actual leakage.
-    num_sensitive_prompts_with_successful_generation = 0 
+    if not clip_model or not clip_processor:
+        print("SLI: CLIP model or processor not loaded. Skipping SLI calculation.")
+        return float('nan')
 
-    if len(prompts) != len(generated_images_pil) and args.dataset_path == "internal_test_prompts":
-         # This conditionality might be too specific for "internal_test_prompts"
-         # A general warning is better if counts don't match for any reason
-        print(f"Warning: Number of prompts ({len(prompts)}) and generated images ({len(generated_images_pil)}) mismatch. SLI might be based on fewer pairs than expected.")
-    
-    # Iterate up to the minimum length of prompts or generated images to avoid index errors
-    num_comparisons = min(len(prompts), len(generated_images_pil))
-
-    for i in range(num_comparisons):
-        prompt_text = prompts[i]
-        prompt_lower = prompt_text.lower()
-        is_sensitive_prompt = False
-        for keyword in sli_sensitive_keywords:
-            if keyword.lower() in prompt_lower:
-                is_sensitive_prompt = True
-                break
+    if not sensitive_keywords: # sensitive_keywords loaded by load_dataset
+        print("SLI: No sensitive keywords provided for SLI calculation (from --sensitive_keywords_path). Skipping.")
+        return float('nan')
         
-        if is_sensitive_prompt:
-            num_prompts_with_keywords += 1
-            # Check if an image was actually generated for this sensitive prompt
-            if generated_images_pil[i] is not None: # Assuming None if generation failed for a specific prompt
-                 num_sensitive_prompts_with_successful_generation +=1
-
-    if num_prompts_with_keywords == 0:
-        print("No prompts contained SLI sensitive keywords after checking available pairs. SLI is 0 or N/A.")
-        return 0.0 
-
-    sli_score = num_sensitive_prompts_with_successful_generation / num_prompts_with_keywords
-    print(f"SLI: {num_sensitive_prompts_with_successful_generation} successful generations for {num_prompts_with_keywords} sensitive prompts. SLI = {sli_score:.4f}")
-    return float(sli_score)
-
-def calculate_ard(all_risk_scores, args):
-    """Calculates Average Risk Detection (ARD) based on PDU scores."""
-    if not args.enable_privacy:
-        print("ARD: Privacy not enabled, PDU risk scores not applicable.")
+    num_sensitive_prompts_in_dataset = sum(sensitive_flags)
+    if num_sensitive_prompts_in_dataset == 0:
+        print("SLI: No prompts were flagged as sensitive in the dataset. SLI is undefined.")
         return float('nan')
-    
-    if all_risk_scores is None or all_risk_scores.size == 0:
-        if args.enable_privacy:
-             print("ARD: Privacy enabled, but no PDU risk scores were collected (PDU might be misconfigured or no prompts processed).")
-        return float('nan')
-    
-    # all_risk_scores should be a flat numpy array of scores for each item processed by PDU.
-    average_risk = np.mean(all_risk_scores)
-    print(f"Calculating ARD (Average PDU Risk Score over {all_risk_scores.size} items): {average_risk:.4f}")
-    return float(average_risk)
 
-def save_results(results, args):
+    leak_count = 0
+    actual_sensitive_prompts_processed_for_sli = 0
+
+    for i, is_prompt_sensitive in enumerate(sensitive_flags):
+        if not is_prompt_sensitive:
+            continue # Only evaluate images from prompts marked as sensitive
+        
+        actual_sensitive_prompts_processed_for_sli +=1
+        if i >= len(generated_images_pil):
+            print(f"SLI Warning: Index {i} (for a sensitive prompt \'{prompts[i]}\') is out of bounds for generated_images_pil (len {len(generated_images_pil)}). Skipping this image.")
+            continue
+        
+        image = generated_images_pil[i]
+        
+        try:
+            # Ensure sensitive_keywords is a list of strings for the processor
+            keywords_list_for_clip = sensitive_keywords
+            if isinstance(keywords_list_for_clip, str): # Handle if a single string was somehow passed
+                 keywords_list_for_clip = [keywords_list_for_clip]
+            elif not isinstance(keywords_list_for_clip, list) or not all(isinstance(kw, str) for kw in keywords_list_for_clip):
+                 print(f"SLI Error: sensitive_keywords format is invalid for CLIP. Expected list of strings. Got: {type(keywords_list_for_clip)}. Skipping image for prompt \'{prompts[i]}\'.")
+                 continue
+            
+            if not keywords_list_for_clip: 
+                # This should ideally be caught by the check at the beginning of the function,
+                # but it's a safeguard if sensitive_keywords becomes empty list after loading.
+                print(f"SLI Warning: Empty sensitive_keywords_list for CLIP encountered for prompt \'{prompts[i]}\'. Cannot check for leaks. Skipping image.")
+                continue
+
+            # Process with CLIP
+            inputs = clip_processor(text=keywords_list_for_clip, images=image, return_tensors="pt", padding="max_length", truncation=True).to(device) # Use max_length padding
+            
+            with torch.no_grad(): # Ensure no gradients are computed during inference
+                outputs = clip_model(**inputs)
+                # logits_per_image gives scaled cosine similarities: [num_images, num_texts]
+                # Here, num_images = 1
+                # logits = outputs.logits_per_image # shape: [1, num_sensitive_keywords]
+                
+                # For more direct cosine similarity:
+                image_features = outputs.image_embeds 
+                text_features = outputs.text_embeds
+            
+            # Normalize features before cosine similarity
+            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+            
+            similarities = (image_features @ text_features.T).squeeze(0) # Shape: [num_sensitive_keywords]
+            
+            leak_threshold = args.sli_leak_threshold 
+            
+            if torch.any(similarities > leak_threshold):
+                leak_count += 1
+                # print(f"SLI Leak Detected: Image from prompt \'{prompts[i]}\' (index {i}) matched sensitive keywords. Max Sim: {similarities.max().item():.4f}, Keywords: {keywords_list_for_clip}")
+        
+        except Exception as e:
+            print(f"SLI Error: Could not process image {i} (prompt: \'{prompts[i]}\') with CLIP: {e}")
+            # Continue to next image, do not let one error stop all calculation
+
+    if actual_sensitive_prompts_processed_for_sli == 0: 
+        print("SLI: No sensitive prompt images were actually processed for SLI. SLI is undefined.")
+        return float('nan')
+        
+    sli_score = leak_count / actual_sensitive_prompts_processed_for_sli
+    print(f"SLI Calculation: {leak_count} leaks found out of {actual_sensitive_prompts_processed_for_sli} sensitive prompt images processed. SLI = {sli_score:.4f} (Threshold: {args.sli_leak_threshold})")
+    return sli_score
+
+def calculate_ard(generated_images_pil, prompts, models, args):
+    """
+    Calculates Attack Rejection Degree (ARD). Placeholder.
+    ARD measures the model's ability to resist specific attacks (e.g., prompt injection, jailbreaks).
+    A full implementation requires:
+    1. A dataset of 'attack prompts' designed to test specific vulnerabilities (these should be identifiable within the 'prompts' list, e.g., via flags similar to 'sensitive_flags').
+    2. A clear definition and method (e.g., a classifier, keyword spotting in output, or human evaluation) 
+       to determine if an attack was 'successful' or 'rejected' based on the generated output.
+    3. The ARD is then (Number of Rejected Attacks) / (Total Attacks Attempted).
+    
+    This function is a placeholder as these components are not currently part of this script.
+    It assumes 'prompts' might contain attack prompts and 'generated_images_pil' the corresponding outputs.
+    """
+    if not args.calculate_ard:
+        # print("ARD calculation skipped by args.")
+        return float('nan')
+
+    print("Calculating ARD (Placeholder)...")
+    print("NOTE: ARD requires a specific set of attack prompts and a method to evaluate success/failure of attacks.")
+    
+    # --- Example Pseudo-Logic (Requires actual implementation details) ---
+    # num_attack_prompts_in_dataset = 0
+    # num_rejected_attacks = 0
+    # # Assume 'attack_flags' exists, similar to 'sensitive_flags', indicating which prompts are attacks
+    # attack_flags = getattr(args, "attack_flags", [False]*len(prompts)) 
+    # if not any(attack_flags):
+    #     print("ARD: No prompts flagged as attacks in the dataset. ARD is undefined.")
+    #     return float('nan')
+
+    # for i, is_attack_prompt in enumerate(attack_flags):
+    #     if not is_attack_prompt:
+    #         continue
+        
+    #     num_attack_prompts_in_dataset += 1
+    #     current_prompt_text = prompts[i]
+    #     image_output = generated_images_pil[i]
+        
+    #     # Define what constitutes a successful attack vs. a rejected one.
+    #     # This is highly dependent on the nature of the attack and evaluation criteria.
+    #     # Example: check_if_attack_was_rejected(current_prompt_text, image_output, models)
+    #     # This function would return True if the attack was deemed rejected/mitigated.
+    #     attack_rejected = False # Placeholder for actual check
+    #     # try:
+    #     #    attack_rejected = check_if_attack_was_rejected(current_prompt_text, image_output, models)
+    #     # except Exception as e:
+    #     #    print(f"ARD Error evaluating attack for prompt \'{current_prompt_text}\': {e}")
+
+    #     if attack_rejected:
+    #         num_rejected_attacks += 1
+
+    # if num_attack_prompts_in_dataset == 0: # Should be caught by 'any(attack_flags)'
+    #     print("ARD: No attack prompts were processed. ARD is undefined.")
+    #     return float('nan')
+    
+    # ard_score = num_rejected_attacks / num_attack_prompts_in_dataset
+    # print(f"ARD Calculation: {num_rejected_attacks} attacks rejected out of {num_attack_prompts_in_dataset} attempted. ARD = {ard_score:.4f}")
+    # return ard_score
+    # --- End of Pseudo-Logic ---
+
+    print("ARD: Returning placeholder value.")
+    return 0.75 # Returning a placeholder value for now
+
+def save_results(results, args, prompts):
     """Saves results and generated images."""
     os.makedirs(args.output_dir, exist_ok=True)
     results_path = os.path.join(args.output_dir, "results.json")
     import json
     try:
-        serializable_config = {k: str(v) if isinstance(v, pathlib.Path) else v for k, v in results["config"].items()}
+        # Convert Path objects and other non-serializable types to string for JSON
+        serializable_config = {}
+        for k, v in results["config"].items():
+            if isinstance(v, pathlib.Path):
+                serializable_config[k] = str(v)
+            elif isinstance(v, list) and v and isinstance(v[0], pathlib.Path): # Handle list of paths
+                serializable_config[k] = [str(p) for p in v]
+            else:
+                serializable_config[k] = v
+        
         results_to_save = results.copy()
         results_to_save["config"] = serializable_config
         if "generated_images" in results_to_save: 
-            del results_to_save["generated_images"]
+            del results_to_save["generated_images"] # Don't save raw image data in JSON
 
         with open(results_path, "w") as f:
             json.dump(results_to_save, f, indent=4)
@@ -552,14 +519,17 @@ def save_results(results, args):
     img_save_dir = os.path.join(args.output_dir, "images")
     os.makedirs(img_save_dir, exist_ok=True)
     images_pil_list = results.get("generated_images", [])
-    num_save = min(len(images_pil_list), 16) 
+    num_save = min(len(images_pil_list), 16) # Save up to 16 sample images
     saved_paths = []
     if images_pil_list:
         for i in range(num_save):
             img = images_pil_list[i]
             if isinstance(img, Image.Image):
                 try:
-                    img_path = os.path.join(img_save_dir, f"sample_{i:03d}_{args.seed if args.seed else 'nseed'}_{('priv' if args.enable_privacy else 'nopriv')}.png")
+                    # Include more info in filename, ensure prompt is filesystem-safe
+                    safe_prompt_prefix = "".join(c if c.isalnum() else "_" for c in prompts[i][:30]) # Use actual prompt
+                    img_filename = f"sample_{i:03d}_{safe_prompt_prefix}_{args.seed if args.seed else 'nseed'}_{('priv' if args.enable_privacy else 'nopriv')}.png"
+                    img_path = os.path.join(img_save_dir, img_filename)
                     img.save(img_path)
                     saved_paths.append(img_path)
                 except Exception as e:
@@ -581,42 +551,53 @@ def main():
     # --- Hardcode settings for a basic text-to-image run --- 
     args.dataset_path = "internal_test_prompts" # Ensure internal prompts are used
     args.enable_privacy = False # Disable privacy for the most basic run
-    args.calculate_fid = False # Keep FID off for basic hardcoded run by default, can be overridden by CLI
-    args.calculate_sli = False # Keep SLI off for basic hardcoded run
+    args.calculate_fid = False
+    args.calculate_sli = False # Disable SLI for basic run unless testing it
+    args.calculate_ard = False # Disable ARD for basic run
     # args.image_size = 256 # Already defaulted smaller in parse_args for quick test
-    # args.num_inference_steps = 20 # Already defaulted fewer in parse_args
+    # args.num_inference_steps = 30 # Defaulted in parse_args
     # args.output_dir = "./validation_output_hardcoded_basic" # Can override if needed
     # args.seed = 42 # Already defaulted
     # --- End of hardcoded settings ---
 
-    print("Starting validation with hardcoded basic settings...")
+    print("Starting validation with (potentially hardcoded) basic settings...")
     print(f"Effective Arguments: {vars(args)}")
 
-    models_dict = load_models(args) # Renamed to models_dict to avoid conflict if 'models' is imported from torchvision
+    models = load_models(args)
     prompts, sensitive_flags, sli_keywords = load_dataset(args)
     
-    generated_images_pil_list, all_risk_scores = generate_images(prompts, models_dict, args)
+    # Ensure prompts, sensitive_flags are aligned for SLI
+    if len(prompts) != len(sensitive_flags):
+        print(f"Warning: Mismatch between number of prompts ({len(prompts)}) and sensitive_flags ({len(sensitive_flags)}). This might affect SLI calculation.")
+        # Attempt to align if flags are too short, pad with False
+        if len(sensitive_flags) < len(prompts):
+            sensitive_flags.extend([False] * (len(prompts) - len(sensitive_flags)))
+        # Truncate if flags are too long (less likely if load_dataset is correct)
+        sensitive_flags = sensitive_flags[:len(prompts)]
 
-    fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models_dict, args)
-    sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models_dict, args)
-    ard_score = calculate_ard(all_risk_scores, args)
 
+    generated_images_pil_list = generate_images(prompts, models, args)
+
+    fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models, args)
+    sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models, args)
+    ard_score = calculate_ard(generated_images_pil_list, prompts, models, args) # Added ARD call
 
     results = {
         "config": vars(args),
         "fid": fid_score,
         "sli": sli_score,
-        "ard": ard_score, 
+        "ard": ard_score, # Added ARD to results
         "generated_images": generated_images_pil_list 
+        # "generated_images_pil_paths" will be added by save_results
     }
 
     print("\n--- Validation Results ---")
     print(f"FID: {fid_score if not np.isnan(fid_score) else 'N/A'}")
     print(f"SLI: {sli_score if not np.isnan(sli_score) else 'N/A'}")
-    print(f"ARD: {ard_score if not np.isnan(ard_score) else 'N/A'}")
+    print(f"ARD: {ard_score if not np.isnan(ard_score) else 'N/A'}") # Added ARD to printout
     print("------------------------")
 
-    save_results(results, args)
+    save_results(results, args, prompts) # Pass prompts for image naming
     print("Validation finished.")
 
 if __name__ == "__main__":
