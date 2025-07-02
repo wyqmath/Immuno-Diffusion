@@ -281,9 +281,10 @@ def generate_images(prompts, models, args):
         current_risk_score = None
         if args.enable_privacy and pdu:
             # PDU's simplified forward takes list of prompts
-            concept_graph = create_dummy_concept_graph()
+            concept_graph = create_dummy_concept_graph().to(device)
             risk_score_batch, _ = pdu(batch_prompts, concept_graph)
-            # print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
+            current_risk_score = risk_score_batch
+            print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
 
         scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = scheduler.timesteps
