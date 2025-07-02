@@ -7,13 +7,14 @@ import math
 from torch_geometric.nn import global_mean_pool
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 from PIL import Image # 用于处理图像输出
+from transformers import BertTokenizer
 
 # TODO List:
 # - [DONE] 将以下模块集成到一个完整的扩散模型框架 (例如 UNet + VAE + Scheduler) 中
-# - 实现 Langevin Dynamics 驱动的可微分隐私引擎
+# - 实现 Langevin Dynamics 驱动的可微分隐私引擎      SEU中实现
 # - [PARTIALLY DONE / PLACEHOLDER] 实现 Apoptosis (注意力自毁), Epigenetic Regulation (提示词加密), Quorum Quenching (分布式)
 # - 实现 SLI, ARD 等评估指标
-# - PrivacyEnhancementUnit: 替换为更复杂的、基于Langevin Dynamics的噪声生成或潜在空间扰动机制
+# - PrivacyEnhancementUnit: 替换为更复杂的、基于Langevin Dynamics的噪声生成或潜在空间扰动机制  
 # - PrivacyEnhancementUnit.forward: 结合 memory_signal 实现更复杂的潜在空间扰动
 # - PrivacyEnhancementUnit.shm_update: 改进此机制 (Note: shm_update was removed in simplified version)
 # - PrivacyDetectionUnit.forward: 可以使用更复杂的图池化方法
@@ -57,54 +58,150 @@ class PrivacyEnhancementUnit(nn.Module):
         noise = torch.randn_like(z) * current_risk_score * self.simple_noise_level
         z_perturbed = z + noise
         return z_perturbed
+    
+    def adaptive_noise(self, risk_level):
+        """
+        根据风险等级自适应生成噪声强度和形态。
+        Args:
+            risk_level (torch.Tensor): 风险等级，范围0~1，形状可为任意可广播形状。
+        Returns:
+            torch.Tensor: 噪声强度张量，与 risk_level 形状相同。
+        """
+        # 参数示例：阈值和最大噪声强度
+        low_risk_threshold = 0.2
+        high_risk_threshold = 0.8
+        max_noise_level = self.simple_noise_level  # 最大噪声强度
+        min_noise_level = 0.01  # 最小噪声强度，避免完全无噪声
 
-    # def adaptive_noise(self, risk_level): # Removed for simplification
-    #     pass
+        # 非线性映射：风险低于低阈值时噪声很小，超过高阈值时噪声接近最大
+        noise_strength = torch.where(
+            risk_level < low_risk_threshold,
+            min_noise_level * torch.ones_like(risk_level),
+            torch.where(
+                risk_level > high_risk_threshold,
+                max_noise_level * torch.ones_like(risk_level),
+                # 中间区间线性插值
+                min_noise_level + (max_noise_level - min_noise_level) * (
+                    (risk_level - low_risk_threshold) / (high_risk_threshold - low_risk_threshold)
+                )
+            )
+        )
 
-    # def shm_update(self, feedback_signal=None): # Removed for simplification
-    #     pass
+        # 进一步调整噪声形态，比如根据风险等级调整噪声的分布形状
+        # 这里示例用风险等级控制噪声的偏度（skewness）或方差
+        # 简单示例：高风险时噪声方差放大1.5倍
+        noise_variance_scale = 1.0 + 0.5 * (risk_level - low_risk_threshold).clamp(min=0) / (1 - low_risk_threshold)
+        noise_strength = noise_strength * noise_variance_scale
+
+        return noise_strength
+
+    #       def adaptive_noise(self, risk_level): # Removed for simplification
+    #           pass上面
+
+
+    def shm_update(self, feedback_signal=None):
+        """
+        根据反馈信号动态调整噪声强度参数 simple_noise_level。
+        Args:
+            feedback_signal (torch.Tensor or None): 反馈信号，形状可为任意，通常是风险评分等。
+        """
+        if feedback_signal is None or feedback_signal.numel() == 0:
+            # 无反馈信号时不更新
+            return
+
+        # 计算反馈信号的均值，转为Python float
+        feedback_mean = feedback_signal.mean().item()
+
+        # 以0.5为基准，反馈越高，噪声强度增加，反馈越低，噪声强度减少
+        adjustment = 0.05 * (feedback_mean - 0.5)  # 调整步长可调
+
+        # 计算新的噪声强度
+        new_noise_level = self.simple_noise_level + adjustment
+
+        # 限制噪声强度在合理范围内，避免过大或过小
+        new_noise_level = max(0.01, min(new_noise_level, 1.0))
+
+        # 更新参数
+        self.simple_noise_level = new_noise_level
+
+        # 打印调试信息（可选）
+        print(f"[SEU shm_update] feedback_mean: {feedback_mean:.4f}, "
+              f"adjustment: {adjustment:.4f}, new_noise_level: {self.simple_noise_level:.4f}")
+
+    #       def shm_update(self, feedback_signal=None): # Removed for simplification
+    #            pass上面
 
 
 class PrivacyDetectionUnit(nn.Module):
-    """
-    隐私检测单元 (PDU - Privacy Detection Unit) - Simplified Version
-    基于关键词检测风险。
-    """
-    def __init__(self, sensitive_keywords: list[str], device: str, feature_dim: int = 512): # Simplified __init__
+    def __init__(self, sensitive_keywords: list[str], device: str, feature_dim: int = 512,
+                 bert_model_name='dmis-lab/biobert-base-cased-v1.1', gat_heads=4, gat_out_channels=128):
         super().__init__()
         self.sensitive_keywords = [kw.lower() for kw in sensitive_keywords]
         self.device = device
-        self.feature_dim = feature_dim # For dummy combined_features
+        self.feature_dim = feature_dim
 
-        # Original BioBERT and GAT components are removed for simplification.
-        # self.biobert = BertModel.from_pretrained(biobert_model_name)
-        # self.text_proj = nn.Linear(768, self.embed_dim)
-        # self.concept_encoder = GATConv(...)
-        # self.cross_attention = nn.MultiheadAttention(...)
-        # self.classifier = nn.Sequential(...)
+        # BioBERT 文本编码器和 tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+        self.biobert = BertModel.from_pretrained(bert_model_name).to(device)
 
-    def forward(self, text_prompts: list[str], concept_graph=None): # concept_graph is ignored
+        # 线性层将BERT输出768维映射到feature_dim
+        self.text_proj = nn.Linear(768, feature_dim)
+
+        # GATConv 图编码器
+        self.gat1 = GATConv(in_channels=feature_dim, out_channels=gat_out_channels, heads=gat_heads, concat=True)
+        self.gat2 = GATConv(in_channels=gat_out_channels * gat_heads, out_channels=feature_dim, heads=1, concat=False)
+
+        # 多头注意力融合文本和图特征
+        self.cross_attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=8, batch_first=True)
+
+        # 分类器，输出风险评分
+        self.classifier = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, text_prompts: list[str], concept_graph):
         """
         Args:
-            text_prompts (list[str]): A list of text prompts.
-            concept_graph: Ignored in this simplified version.
+            text_prompts: list of strings, batch size = B
+            concept_graph: PyG Data batch，包含 x (节点特征), edge_index (边索引), batch (节点所属图)
         Returns:
-            torch.Tensor: 隐私泄露风险评分 (0-1), shape [batch_size, 1]
-            torch.Tensor: 融合后的特征表示 (dummy), shape [batch_size, feature_dim]
+            risk_scores: [B, 1] 风险评分
+            combined_features: [B, feature_dim] 融合特征
         """
         batch_size = len(text_prompts)
-        risk_scores = []
-        for prompt in text_prompts:
-            prompt_lower = prompt.lower()
-            is_sensitive = any(keyword in prompt_lower for keyword in self.sensitive_keywords)
-            risk_scores.append(0.8 if is_sensitive else 0.1)
-        
-        risk_tensor = torch.tensor(risk_scores, dtype=torch.float32, device=self.device).unsqueeze(1)
-        
-        # Dummy combined_features
-        combined_features_dummy = torch.zeros(batch_size, self.feature_dim, device=self.device)
-        
-        return risk_tensor, combined_features_dummy
+
+        # 1. 文本编码
+        encoding = self.tokenizer(text_prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
+        bert_outputs = self.biobert(**encoding)
+        # 取 [CLS] token 的隐藏状态作为文本表示
+        text_feats = bert_outputs.last_hidden_state[:, 0, :]  # [B, 768]
+        text_feats = self.text_proj(text_feats)  # [B, feature_dim]
+
+        # 2. 图编码
+        x, edge_index, batch = concept_graph.x, concept_graph.edge_index, concept_graph.batch
+        x = self.gat1(x, edge_index)
+        x = F.elu(x)
+        x = self.gat2(x, edge_index)  # [num_nodes, feature_dim]
+
+        # 对每个图做全局池化，得到图的特征向量 [B, feature_dim]
+        graph_feats = global_mean_pool(x, batch)  # [B, feature_dim]
+
+        # 3. 融合机制
+        # 文本作为 query，图作为 key 和 value
+        query = text_feats.unsqueeze(1)  # [B, 1, feature_dim]
+        key = graph_feats.unsqueeze(1)   # [B, 1, feature_dim]
+        value = graph_feats.unsqueeze(1) # [B, 1, feature_dim]
+
+        attn_output, _ = self.cross_attention(query, key, value)  # [B, 1, feature_dim]
+        attn_output = attn_output.squeeze(1)  # [B, feature_dim]
+
+        # 4. 分类器输出风险评分
+        risk_scores = self.classifier(attn_output)  # [B, 1]
+
+        return risk_scores, attn_output
 
     # adversarial_training 方法保持不变，模拟进化 (though may not be used with simplified PDU)
 
