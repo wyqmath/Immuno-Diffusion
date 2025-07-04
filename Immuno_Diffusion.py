@@ -45,29 +45,63 @@ class PrivacyEnhancementUnit(nn.Module):
     模拟 B 细胞生成抗体（隐私保护噪声/扰动）的过程。
     在扩散模型的潜在空间中操作，根据风险评估动态调整防御策略。
     """
-    def __init__(self, latent_dim, simple_noise_level=0.1): # Simplified __init__
+    def __init__(self, latent_dim, simple_noise_level=0.1):
         super().__init__()
         self.latent_dim = latent_dim
         self.simple_noise_level = simple_noise_level
-        # Original parameters (noise_scale, base_sigma, epsilon, adaptive_strength) are removed for simplification.
 
-    def forward(self, z, t, risk_score, memory_signal=None): # t and memory_signal are ignored in this simplified version
+    def forward(self, z, t, risk_score, memory_signal=None):
         """
-        在扩散过程的某一步应用防御。
         Args:
-            z (torch.Tensor): 当前步的潜在表示 (Latent representation).
-            t (torch.Tensor): 当前时间步 (Timestep) - ignored in simplified version.
-            risk_score (torch.Tensor): 来自 PDU 的风险评分 (0-1), shape [batch_size, 1] or [batch_size].
-            memory_signal (torch.Tensor, optional): 来自 ImmuneMemoryModule 的信号 - ignored.
+            z (torch.Tensor): 当前步的潜在表示，形状 [B, C, H, W]
+            t (torch.Tensor): 当前时间步（未使用）
+            risk_score (torch.Tensor): 风险评分，形状 [B, 1]
+            memory_signal (torch.Tensor or None): 免疫记忆信号，形状 [B, memory_dim]
         Returns:
-            torch.Tensor: 添加了隐私保护扰动的潜在表示。
+            torch.Tensor: 添加扰动后的潜变量
         """
-        # Ensure risk_score is correctly shaped for broadcasting: [batch_size, 1, 1, 1]
-        current_risk_score = risk_score.view(-1, 1, 1, 1)
-        
-        noise = torch.randn_like(z) * current_risk_score * self.simple_noise_level
+        current_risk_score = risk_score.view(-1, 1, 1, 1)  # 形状匹配 z
+
+        base_noise_level = self.simple_noise_level
+
+        if memory_signal is not None:
+            # 计算记忆信号强度（范数）
+            memory_strength = memory_signal.norm(dim=1, keepdim=True)  # [B, 1]
+            memory_strength = memory_strength.view(-1, 1, 1, 1)  # 形状匹配 z
+
+            threshold_high = 1.0
+            threshold_low = 0.3
+
+            if (memory_strength > threshold_high).any():
+                # 强烈记忆信号，使用非高斯脉冲噪声
+                noise = self.generate_targeted_noise(z.shape, device=z.device)
+                noise = noise * current_risk_score * base_noise_level * 2.0  # 放大噪声强度
+            elif (memory_strength > threshold_low).any():
+                # 中等记忆信号，使用加权高斯噪声
+                noise = torch.randn_like(z) * current_risk_score * base_noise_level * (1.0 + memory_strength)
+            else:
+                # 低记忆信号，使用基础高斯噪声
+                noise = torch.randn_like(z) * current_risk_score * base_noise_level
+        else:
+            # 无记忆信号，使用基础高斯噪声
+            noise = torch.randn_like(z) * current_risk_score * base_noise_level
+
         z_perturbed = z + noise
         return z_perturbed
+
+    def generate_targeted_noise(self, shape, device):
+        """
+        生成非高斯"精确制导"噪声，示例为稀疏脉冲噪声。
+        """
+        noise = torch.zeros(shape, device=device)
+        batch_size = shape[0]
+        num_spikes = max(1, batch_size // 10)  # 例如批量大小的十分之一
+
+        for _ in range(num_spikes):
+            idx = torch.randint(0, batch_size, (1,))
+            noise[idx] = torch.randn_like(noise[idx]) * 5.0  # 放大扰动幅度
+
+        return noise
     
     def adaptive_noise(self, risk_level):
         """
@@ -172,21 +206,24 @@ class PrivacyDetectionUnit(nn.Module):
             nn.Sigmoid()
         )
 
+    def keyword_risk_score(self, text_prompts):
+        """
+        基于规则的关键词检测风险评分
+        """
+        batch_scores = []
+        for prompt in text_prompts:
+            prompt_lower = prompt.lower()
+            hits = sum(1 for kw in self.sensitive_keywords if kw in prompt_lower)
+            score = min(1.0, hits / max(1, len(self.sensitive_keywords)))  # 归一化
+            batch_scores.append(score)
+        return torch.tensor(batch_scores, device=self.device).unsqueeze(1)  # [B,1]
+
     def forward(self, text_prompts: list[str], concept_graph):
-        """
-        Args:
-            text_prompts: list of strings, batch size = B
-            concept_graph: PyG Data batch，包含 x (节点特征), edge_index (边索引), batch (节点所属图)
-        Returns:
-            risk_scores: [B, 1] 风险评分
-            combined_features: [B, feature_dim] 融合特征
-        """
         batch_size = len(text_prompts)
 
         # 1. 文本编码
         encoding = self.tokenizer(text_prompts, padding=True, truncation=True, return_tensors='pt').to(self.device)
         bert_outputs = self.biobert(**encoding)
-        # 取 [CLS] token 的隐藏状态作为文本表示
         text_feats = bert_outputs.last_hidden_state[:, 0, :]  # [B, 768]
         text_feats = self.text_proj(text_feats)  # [B, feature_dim]
 
@@ -195,23 +232,26 @@ class PrivacyDetectionUnit(nn.Module):
         x = self.gat1(x, edge_index)
         x = F.elu(x)
         x = self.gat2(x, edge_index)  # [num_nodes, feature_dim]
-
-        # 对每个图做全局池化，得到图的特征向量 [B, feature_dim]
         graph_feats = global_mean_pool(x, batch)  # [B, feature_dim]
 
         # 3. 融合机制
-        # 文本作为 query，图作为 key 和 value
         query = text_feats.unsqueeze(1)  # [B, 1, feature_dim]
         key = graph_feats.unsqueeze(1)   # [B, 1, feature_dim]
         value = graph_feats.unsqueeze(1) # [B, 1, feature_dim]
-
         attn_output, _ = self.cross_attention(query, key, value)  # [B, 1, feature_dim]
         attn_output = attn_output.squeeze(1)  # [B, feature_dim]
 
-        # 4. 分类器输出风险评分
-        risk_scores = self.classifier(attn_output)  # [B, 1]
+        # 4. 分类器输出学习风险评分
+        learned_risk_scores = self.classifier(attn_output)  # [B, 1]
 
-        return risk_scores, attn_output
+        # 5. 计算基于规则的关键词风险评分
+        rule_risk_scores = self.keyword_risk_score(text_prompts)  # [B, 1]
+
+        # 6. 混合风险评估（加权平均）
+        alpha = 0.5  # 权重，可调节
+        final_risk_scores = alpha * learned_risk_scores + (1 - alpha) * rule_risk_scores
+
+        return final_risk_scores, attn_output
 
     # adversarial_training 方法保持不变，模拟进化 (though may not be used with simplified PDU)
 
@@ -612,7 +652,7 @@ class ImmunoDiffusionModel(nn.Module):
             current_concept_graph = Data(x=dummy_x, edge_index=dummy_edge_index, batch=None).to(self.device)
 
 
-        risk_score, combined_features = self.pdu(pdu_biobert_input, current_concept_graph)
+        risk_score, combined_features = self.pdu(prompt, current_concept_graph)
         # risk_score: [batch_size * num_images_per_prompt, 1]
         # combined_features: [batch_size * num_images_per_prompt, pdu.embed_dim * 2]
         # 如果 PDU 的 batch size 与 text_embeddings 不一致 (因为 CFG)，需要调整

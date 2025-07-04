@@ -8,29 +8,110 @@ import numpy as np
 from tqdm import tqdm
 import os
 import pathlib # For save_results to handle Path objects if any in args
-
+import spacy
+import clip
+from torch_geometric.data import Data
+import requests
+from pathlib import Path
+from torchvision import transforms
 from diffusers import AutoencoderKL, UNet2DConditionModel, EulerDiscreteScheduler
 # from diffusers.utils import randn_tensor # -> Replaced with torch.randn
 from transformers import CLIPTextModel, CLIPTokenizer
-
-
 from torch_geometric.data import Data
-
 # 导入简化的PDU和SEU
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit 
-
 from torch_geometric.data import Data
+from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit, ImmuneMemoryModule
+import torchvision.models as models
+import torch.nn.functional as F
+from torchmetrics.image.fid import FrechetInceptionDistance
+from PIL import Image
 
 print(f"--- Python Script Start ---")
 # 先设置节点在终端$env:HF_ENDPOINT = "https://hf-mirror.com"
 print(f"HF_ENDPOINT from os.environ: {os.getenv('HF_ENDPOINT')}")
 print(f"--- End of ENV Check ---")
 
-# 创建一个空的概念图
-def create_dummy_concept_graph():
-    x = torch.zeros((1, 512))  # 节点特征，512维
-    edge_index = torch.empty((2, 0), dtype=torch.long)  # 空边集
-    return Data(x=x, edge_index=edge_index)
+
+nlp = spacy.load("en_core_web_sm")
+
+def extract_entities(text):
+    """
+    使用 spaCy NER 提取实体
+    """
+    doc = nlp(text)
+    entities = list(set([ent.text.lower() for ent in doc.ents]))
+    return entities
+
+def query_conceptnet_edges(entities):
+    """
+    查询 ConceptNet API，获取实体间的关系边
+    返回边列表 [(src_idx, tgt_idx), ...]
+    """
+    edges = []
+    entity_to_idx = {e: i for i, e in enumerate(entities)}
+
+    for e1 in entities:
+        url = f"http://api.conceptnet.io/c/en/{e1.replace(' ', '_')}"
+        try:
+            resp = requests.get(url).json()
+            for edge in resp.get('edges', []):
+                start = edge['start']['label'].lower()
+                end = edge['end']['label'].lower()
+                if start in entity_to_idx and end in entity_to_idx:
+                    src = entity_to_idx[start]
+                    tgt = entity_to_idx[end]
+                    edges.append((src, tgt))
+        except Exception as ex:
+            print(f"ConceptNet query failed for {e1}: {ex}")
+    return edges, entity_to_idx
+
+def build_node_features(entities, feature_dim=512):
+    """
+    简单示例：用随机向量作为节点特征
+    你可以用更复杂的词向量或预训练模型生成特征
+    """
+    return torch.randn(len(entities), feature_dim)
+
+def create_concept_graph_from_prompts(prompts, feature_dim=512, device='cpu'):
+    """
+    输入：文本提示词列表
+    输出：torch_geometric.data.Data 对象，批量图
+    """
+    all_entities = []
+    for prompt in prompts:
+        ents = extract_entities(prompt)
+        print(f"Prompt: {prompt} -> Entities: {ents}")  # 调试打印
+        all_entities.append(ents)
+
+    # 合并所有实体，去重
+    unique_entities = list(set([e for ents in all_entities for e in ents]))
+
+    if len(unique_entities) == 0:
+        # 没提取到实体，构造最小图，避免空张量
+        x = torch.zeros((1, feature_dim), device=device)
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        batch = torch.zeros((1,), dtype=torch.long, device=device)
+        return Data(x=x, edge_index=edge_index, batch=batch)
+
+    edges, entity_to_idx = query_conceptnet_edges(unique_entities)
+    x = build_node_features(unique_entities, feature_dim).to(device)
+
+    if len(edges) > 0:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+
+    batch = []
+    for i, ents in enumerate(all_entities):
+        for e in ents:
+            batch.append(i)
+    batch = torch.tensor(batch, dtype=torch.long, device=device)
+
+    data = Data(x=x, edge_index=edge_index, batch=batch)
+    return data
+
+
 
 
 
@@ -86,63 +167,55 @@ def parse_args():
 
     return args
 
+from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit, ImmuneMemoryModule
+
 def load_models(args):
-    """Loads the necessary models."""
     print("Loading models...")
     device = torch.device(args.device)
     model_id = args.model_id
 
-    try:
-        # 这些调用会受到 HF_ENDPOINT 环境变量的影响
-        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-        text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
-        vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
-        unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
-        scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
-        print(f"Base diffusion components ({model_id}) loaded successfully.")
-    except Exception as e:
-        print(f"Error loading base diffusion model from {model_id}: {e}")
-        print("Please ensure the model_id is correct and you have an internet connection if downloading, or the model is cached.")
-        raise
+    # 加载基础扩散模型组件
+    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
+    unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
+    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-    pdu, seu = None, None
+    pdu, seu, memory = None, None, None
+    clip_model, clip_preprocess = None, None  # 先初始化
+
     if args.enable_privacy:
-        print(f"Privacy mechanisms enabled. Initializing simplified PDU and SEU.")
-        # PDU expects feature_dim for its dummy output, matching ImmuneMemoryModule input_dim (default 512)
+        print(f"Privacy mechanisms enabled. Initializing simplified PDU, SEU and ImmuneMemoryModule.")
         pdu = PrivacyDetectionUnit(sensitive_keywords=args.pdu_sensitive_keywords, device=args.device, feature_dim=512).to(device)
-        
         seu_latent_dim = unet.config.in_channels
         seu = PrivacyEnhancementUnit(latent_dim=seu_latent_dim, simple_noise_level=args.seu_noise_level).to(device)
-        print(f"Simplified PDU and SEU initialized. PDU keywords: {args.pdu_sensitive_keywords}, SEU noise: {args.seu_noise_level}.")
+        memory_config = {
+            "input_dim": 512,
+            "fourier_dim": 10,
+            "memory_dim": 256,
+            "similarity_threshold": 0.7,
+        }
+        memory = ImmuneMemoryModule(**memory_config).to(device)
+        clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+        print(f"PDU, SEU, ImmuneMemoryModule and CLIP model initialized.")
     else:
         print("Privacy mechanisms disabled.")
 
-    clip_model, clip_processor = None, None 
-    if args.calculate_sli or args.calculate_fid: # FID might also use CLIP
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-            clip_model_id_to_load = args.clip_model_id
-            print(f"Loading CLIP model ({clip_model_id_to_load}) for SLI/FID...")
-            clip_processor = CLIPProcessor.from_pretrained(clip_model_id_to_load)
-            clip_model = CLIPModel.from_pretrained(clip_model_id_to_load).to(device)
-            clip_model.eval() # Set to eval mode
-            print("CLIP model and processor loaded successfully.")
-        except ImportError:
-            print("Transformers library not fully installed or CLIP components missing. Please ensure 'transformers' and 'torch' are correctly installed.")
-        except Exception as e:
-            print(f"Error loading CLIP model ({args.clip_model_id}): {e}")
-
-    fid_metric = None # Placeholder for actual FID metric logic
-
     models = {
-        "tokenizer": tokenizer, "text_encoder": text_encoder,
-        "vae": vae, "unet": unet, "scheduler": scheduler,
-        "pdu": pdu, "seu": seu, 
-        "clip_model": clip_model, "clip_processor": clip_processor, 
-        "fid_metric": fid_metric, 
+        "tokenizer": tokenizer,
+        "text_encoder": text_encoder,
+        "vae": vae,
+        "unet": unet,
+        "scheduler": scheduler,
+        "pdu": pdu,
+        "seu": seu,
+        "memory": memory,
+        "clip_model": clip_model,
+        "clip_preprocess": clip_preprocess,
         "device": device,
-        "vae_scale_factor": 2 ** (len(vae.config.block_out_channels) - 1)
+        "vae_scale_factor": 2 ** (len(vae.config.block_out_channels) - 1),
     }
+
     print("Models dictionary created.")
     return models
 
@@ -244,6 +317,7 @@ def generate_images(prompts, models, args):
 
     pdu = models.get("pdu")
     seu = models.get("seu")
+    memory = models.get("memory")  # 新增：获取免疫记忆模块
 
     height = args.image_size
     width = args.image_size
@@ -253,17 +327,23 @@ def generate_images(prompts, models, args):
 
     # Use a generator for reproducible results if seed is provided
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
-    if args.seed is not None: # Also set global Pytorch seed
+    if args.seed is not None:  # Also set global Pytorch seed
         torch.manual_seed(args.seed)
-        if device.type == "cuda": torch.cuda.manual_seed_all(args.seed) # check device type
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(args.seed)  # check device type
 
     generated_images_pil = []
     num_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    pdu = models.get("pdu")
+    seu = models.get("seu")
+    memory = models.get("memory")  # 新增：获取免疫记忆模块
 
     for i in tqdm(range(num_batches), desc="Generating Batches"):
         batch_prompts = prompts[i * batch_size : (i + 1) * batch_size]
         current_batch_size = len(batch_prompts)
 
+        # 文本编码部分（保持不变）
         text_input = tokenizer(batch_prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
         text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
 
@@ -274,17 +354,27 @@ def generate_images(prompts, models, args):
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         latents_shape = (current_batch_size, unet.config.in_channels, height // vae_scale_factor, width // vae_scale_factor)
-        # Use torch.randn directly as per diffusers convention
         latents = torch.randn(latents_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
         latents = latents * scheduler.init_noise_sigma
 
+        # 这里开始替换为你给出的代码段
         current_risk_score = None
-        if args.enable_privacy and pdu:
-            # PDU's simplified forward takes list of prompts
-            concept_graph = create_dummy_concept_graph().to(device)
-            risk_score_batch, _ = pdu(batch_prompts, concept_graph)
+        memory_signal = None  # 新增初始化
+
+        if args.enable_privacy and pdu and seu and memory:
+            concept_graph = create_concept_graph_from_prompts(batch_prompts, feature_dim=512, device=device)
+            risk_score_batch, combined_features = pdu(batch_prompts, concept_graph)
             current_risk_score = risk_score_batch
-            print(f"  Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}") # Log risk scores
+            print(f"Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}")
+
+            if current_risk_score.mean() > 0.5:
+                memory.update_memory(combined_features)
+                memory_signal = memory.query_memory(combined_features)
+            else:
+                memory_signal = None
+
+            if memory_signal is not None and memory_signal.shape[0] != current_batch_size:
+                memory_signal = memory_signal.repeat_interleave(1, dim=0)  # 根据需要调整
 
         scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = scheduler.timesteps
@@ -298,22 +388,18 @@ def generate_images(prompts, models, args):
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-            
+
             prev_latents = scheduler.step(noise_pred, t, latents).prev_sample
 
             if args.enable_privacy and seu and current_risk_score is not None:
-                # SEU's forward: z, t, risk_score, memory_signal=None
-                # Ensure risk_score matches batch size of prev_latents
-                # current_risk_score is [current_batch_size, 1]
-                latents = seu(prev_latents, t, current_risk_score, memory_signal=None)
+                latents = seu(prev_latents, t, current_risk_score, memory_signal=memory_signal)
             else:
                 latents = prev_latents
         
-        # Standard VAE scaling factor is 0.18215
         latents = 1 / vae.config.scaling_factor * latents 
         image = vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image_np = image.cpu().permute(0, 2, 3, 1).float().numpy() # Ensure float for numpy conversion
+        image_np = image.cpu().permute(0, 2, 3, 1).float().numpy()
         
         for img_np_single in image_np:
             pil_img = Image.fromarray((img_np_single * 255).astype(np.uint8))
@@ -322,30 +408,66 @@ def generate_images(prompts, models, args):
     print(f"Total generated images: {len(generated_images_pil)}")
     return generated_images_pil
 
+def preprocess_images(pil_images, device):
+    transform = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor(),
+    ])
+    tensors = [transform(img).to(device) for img in pil_images]
+    return torch.stack(tensors)
+
+def load_images_from_folder(folder_path):
+    image_paths = list(Path(folder_path).glob("*.*"))
+    images = []
+    for p in image_paths:
+        try:
+            img = Image.open(p).convert("RGB")
+            images.append(img)
+        except Exception as e:
+            print(f"Failed to load image {p}: {e}")
+    return images
+
 def calculate_fid(generated_images_pil, reference_path, models, args):
     if not args.calculate_fid:
-        # print("FID calculation skipped by args.")
+        print("FID calculation skipped by args.")
         return float('nan')
-    if not reference_path or not os.path.exists(reference_path):
-        print(f"Reference FID path {reference_path} not found. Skipping FID.")
+
+    device = models["device"]
+
+    real_images_pil = load_images_from_folder(reference_path)
+    if len(real_images_pil) == 0:
+        print("No reference images found for FID calculation.")
         return float('nan')
-    print("Calculating FID (Placeholder)...")
-    # Actual FID calculation would require a library like torchmetrics or pytorch-fid
-    # and an Inception model or CLIP features.
-    # Example:
-    # from torchmetrics.image.fid import FrechetInceptionDistance
-    # fid = FrechetInceptionDistance(feature=64).to(models["device"]) # Example feature layer
-    # # Preprocess images to uint8 tensors [N, C, H, W] in range [0, 255]
-    # for img_pil in generated_images_pil:
-    #    img_tensor = torch.tensor(np.array(img_pil)).permute(2,0,1)
-    #    fid.update(img_tensor.unsqueeze(0), real=False)
-    # # Load and process real images
-    # # for real_img_path in Path(reference_path).glob('*.png'): # Or other formats
-    # #    real_img_pil = Image.open(real_img_path).convert("RGB")
-    # #    real_img_tensor = torch.tensor(np.array(real_img_pil)).permute(2,0,1)
-    # #    fid.update(real_img_tensor.unsqueeze(0), real=True)
-    # # return fid.compute().item()
-    return 50.0 
+
+    real_tensors = preprocess_images(real_images_pil, device)
+    gen_tensors = preprocess_images(generated_images_pil, device)
+
+    fid_metric = FrechetInceptionDistance(feature=2048).to(device)
+    fid_metric.update(real_tensors, real=True)
+    fid_metric.update(gen_tensors, real=False)
+
+    fid_value = fid_metric.compute().item()
+    print(f"FID: {fid_value}")
+    return fid_value
+
+def pil_images_to_tensor(pil_images, device):
+    transform = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor(),  # 转为 [0,1]
+    ])
+    tensors = [transform(img).to(device) for img in pil_images]
+    return torch.stack(tensors)
+
+def load_images_from_folder(folder_path):
+    image_paths = list(Path(folder_path).glob("*.*"))
+    images = []
+    for p in image_paths:
+        try:
+            img = Image.open(p).convert("RGB")
+            images.append(img)
+        except Exception as e:
+            print(f"Failed to load image {p}: {e}")
+    return images
 
 def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keywords, models, args):
     if not args.calculate_sli:
@@ -353,11 +475,11 @@ def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keyw
         return float('nan')
     
     clip_model = models.get("clip_model")
-    clip_processor = models.get("clip_processor")
+    clip_preprocess = models.get("clip_preprocess")
     device = models.get("device")
 
-    if not clip_model or not clip_processor:
-        print("SLI: CLIP model or processor not loaded. Skipping SLI calculation.")
+    if not clip_model or not clip_preprocess:
+        print("SLI: CLIP model or preprocess not loaded. Skipping SLI calculation.")
         return float('nan')
 
     if not sensitive_keywords: # sensitive_keywords loaded by load_dataset
@@ -384,7 +506,7 @@ def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keyw
         image = generated_images_pil[i]
         
         try:
-            # Ensure sensitive_keywords is a list of strings for the processor
+            # Ensure sensitive_keywords is a list of strings for the preprocess
             keywords_list_for_clip = sensitive_keywords
             if isinstance(keywords_list_for_clip, str): # Handle if a single string was somehow passed
                  keywords_list_for_clip = [keywords_list_for_clip]
@@ -399,18 +521,18 @@ def calculate_sli(generated_images_pil, prompts, sensitive_flags, sensitive_keyw
                 continue
 
             # Process with CLIP
-            inputs = clip_processor(text=keywords_list_for_clip, images=image, return_tensors="pt", padding="max_length", truncation=True).to(device) # Use max_length padding
-            
-            with torch.no_grad(): # Ensure no gradients are computed during inference
-                outputs = clip_model(**inputs)
+            text_inputs = clip.tokenize(keywords_list_for_clip).to(device)
+            image_input = clip_preprocess(image).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                text_features = clip_model.encode_text(text_inputs)
+                image_features = clip_model.encode_image(image_input)
                 # logits_per_image gives scaled cosine similarities: [num_images, num_texts]
                 # Here, num_images = 1
                 # logits = outputs.logits_per_image # shape: [1, num_sensitive_keywords]
                 
                 # For more direct cosine similarity:
-                image_features = outputs.image_embeds 
-                text_features = outputs.text_embeds
-            
+               
             # Normalize features before cosine similarity
             image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
             text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
@@ -451,10 +573,10 @@ def calculate_ard(generated_images_pil, prompts, models, args, attack_keywords=N
         return float('nan')
 
     clip_model = models.get("clip_model")
-    clip_processor = models.get("clip_processor")
+    clip_preprocess = models.get("clip_preprocess")
     device = models.get("device")
 
-    if not clip_model or not clip_processor:
+    if not clip_model or not clip_preprocess:
         print("ARD: CLIP模型未加载，无法计算ARD。")
         return float('nan')
 
@@ -481,11 +603,12 @@ def calculate_ard(generated_images_pil, prompts, models, args, attack_keywords=N
             continue
         image = generated_images_pil[i]
 
-        inputs = clip_processor(text=attack_keywords, images=image, return_tensors="pt", padding=True).to(device)
+        text_inputs = clip.tokenize(attack_keywords).to(device)
+        image_input = clip_preprocess(image).unsqueeze(0).to(device)  # 单张图像加batch维度
+
         with torch.no_grad():
-            outputs = clip_model(**inputs)
-            image_features = outputs.image_embeds
-            text_features = outputs.text_embeds
+            text_features = clip_model.encode_text(text_inputs)
+            image_features = clip_model.encode_image(image_input)
             image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
             text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
             similarities = (image_features @ text_features.T).squeeze(0)
@@ -617,13 +740,12 @@ def main():
     # args.image_size = 256 # Already defaulted smaller in parse_args for quick test
     # args.num_inference_steps = 30 # Defaulted in parse_args
     # 设置参考图像文件夹路径（用于FID计算）
-    args.reference_fid_path = r"D:\WOOd.W的大学\科研\xju大创\ID\test\ref_imgs"
+    args.reference_fid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "ref_imgs")
 
     # 设置敏感关键词文件路径（用于SLI计算）
-    args.sensitive_keywords_path = r"D:\WOOd.W的大学\科研\xju大创\ID\test\keywords.txt"
+    args.sensitive_keywords_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "keywords.txt")
 
     # 设置输出目录
-    args.output_dir = r"D:\WOOd.W的大学\科研\xju大创\ID\test"
     args.output_dir = "./validation_output_hardcoded_basic" # Can override if needed
     # args.seed = 42 # Already defaulted
     # --- End of hardcoded settings ---

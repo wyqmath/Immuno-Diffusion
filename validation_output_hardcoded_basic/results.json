@@ -2,7 +2,7 @@
     "config": {
         "dataset_path": "internal_test_prompts",
         "model_id": "runwayml/stable-diffusion-v1-5",
-        "sensitive_keywords_path": "D:\\WOOd.W\u7684\u5927\u5b66\\\u79d1\u7814\\xju\u5927\u521b\\ID\\test\\keywords.txt",
+        "sensitive_keywords_path": "d:\\WOOd.W\u7684\u5927\u5b66\\\u79d1\u7814\\xju\u5927\u521b\\ID\\Immuno-Diffusion\\test\\keywords.txt",
         "pdu_sensitive_keywords": [
             "secret",
             "private",
@@ -10,7 +10,7 @@
             "internal"
         ],
         "seu_noise_level": 0.05,
-        "reference_fid_path": "D:\\WOOd.W\u7684\u5927\u5b66\\\u79d1\u7814\\xju\u5927\u521b\\ID\\test\\ref_imgs",
+        "reference_fid_path": "d:\\WOOd.W\u7684\u5927\u5b66\\\u79d1\u7814\\xju\u5927\u521b\\ID\\Immuno-Diffusion\\test\\ref_imgs",
         "output_dir": "./validation_output_hardcoded_basic",
         "batch_size": 1,
         "num_samples": 3,
@@ -26,7 +26,7 @@
         "clip_model_id": "openai/clip-vit-base-patch32",
         "sli_leak_threshold": 0.1
     },
-    "fid": 50.0,
+    "fid": 35.066768646240234,
     "sli": 1.0,
     "ard": 1.0
 }
