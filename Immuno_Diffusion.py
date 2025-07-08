@@ -8,6 +8,8 @@ from torch_geometric.nn import global_mean_pool
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 from PIL import Image # 用于处理图像输出
 from transformers import BertTokenizer
+from diffusers.models.attention import Attention
+from epigenetic_encoding.epigenetic_encoding import RealNVP
 
 # TODO List:
 # --- 整合与验证 ---
@@ -39,16 +41,42 @@ from transformers import BertTokenizer
 # - [DONE] ImmunoDiffusionModel.forward: 确保所有组件的输入输出维度匹配。
 # - [DONE] ImmunoDiffusionModel.forward: 添加对 device (cuda/cpu) 的处理。
 
-class PrivacyEnhancementUnit(nn.Module):
+class PrivacyEnhancementUnit(nn.Module):## --- SGLD
     """
     安全增强单元 (SEU - Security Enhancement Unit) - Simplified Version
     模拟 B 细胞生成抗体（隐私保护噪声/扰动）的过程。
     在扩散模型的潜在空间中操作，根据风险评估动态调整防御策略。
     """
-    def __init__(self, latent_dim, simple_noise_level=0.1):
+    def __init__(self, latent_dim, simple_noise_level=0.1, sgld_steps=5, pulse_noise_prob=0.2):
+        """
+        Args:
+            latent_dim (int): 潜变量维度（通道数）
+            simple_noise_level (float): 基础噪声强度，作为SGLD步长
+            sgld_steps (int): SGLD迭代步数
+            pulse_noise_prob (float): 每步混入脉冲噪声的概率
+        """
         super().__init__()
         self.latent_dim = latent_dim
         self.simple_noise_level = simple_noise_level
+        self.sgld_steps = sgld_steps
+        self.pulse_noise_prob = pulse_noise_prob
+
+    def generate_targeted_noise(self, shape, device):
+        """
+        生成非高斯脉冲噪声的示例实现
+        """
+        noise = torch.zeros(shape, device=device)
+        batch_size, channels, height, width = shape
+        num_pulses = max(1, height * width // 100)  # 脉冲数量可调
+
+        for b in range(batch_size):
+            for _ in range(num_pulses):
+                x = torch.randint(0, height, (1,)).item()
+                y = torch.randint(0, width, (1,)).item()
+                c = torch.randint(0, channels, (1,)).item()
+                noise[b, c, x, y] = torch.randn(1).item() * 5.0  # 脉冲强度可调
+
+        return noise
 
     def forward(self, z, t, risk_score, memory_signal=None):
         """
@@ -60,48 +88,36 @@ class PrivacyEnhancementUnit(nn.Module):
         Returns:
             torch.Tensor: 添加扰动后的潜变量
         """
-        current_risk_score = risk_score.view(-1, 1, 1, 1)  # 形状匹配 z
 
-        base_noise_level = self.simple_noise_level
+        print(f"[SEU] SGLD forward called with z shape: {z.shape}, risk_score mean: {risk_score.mean().item():.4f}")
 
-        if memory_signal is not None:
-            # 计算记忆信号强度（范数）
-            memory_strength = memory_signal.norm(dim=1, keepdim=True)  # [B, 1]
-            memory_strength = memory_strength.view(-1, 1, 1, 1)  # 形状匹配 z
+        z_perturbed = z.clone()
+        batch_size = z.shape[0]
+        device = z.device
 
-            threshold_high = 1.0
-            threshold_low = 0.3
+        sgld_step_size = self.simple_noise_level
+        if risk_score is not None:
+            sgld_step_size = self.adaptive_noise(risk_score).mean().item()
 
-            if (memory_strength > threshold_high).any():
-                # 强烈记忆信号，使用非高斯脉冲噪声
-                noise = self.generate_targeted_noise(z.shape, device=z.device)
-                noise = noise * current_risk_score * base_noise_level * 2.0  # 放大噪声强度
-            elif (memory_strength > threshold_low).any():
-                # 中等记忆信号，使用加权高斯噪声
-                noise = torch.randn_like(z) * current_risk_score * base_noise_level * (1.0 + memory_strength)
-            else:
-                # 低记忆信号，使用基础高斯噪声
-                noise = torch.randn_like(z) * current_risk_score * base_noise_level
-        else:
-            # 无记忆信号，使用基础高斯噪声
-            noise = torch.randn_like(z) * current_risk_score * base_noise_level
+        for _ in range(self.sgld_steps):
+            # 计算梯度方向（示例：risk_score广播）
+            grad = risk_score.view(batch_size, 1, 1, 1).expand_as(z_perturbed)
 
-        z_perturbed = z + noise
+            if memory_signal is not None:
+                mem_strength = memory_signal.norm(dim=1, keepdim=True).view(batch_size, 1, 1, 1)
+                grad = grad * (1 + mem_strength)
+
+            # SGLD更新：z = z - 0.5 * step_size * grad + sqrt(step_size) * noise
+            noise = torch.randn_like(z_perturbed) * (sgld_step_size ** 0.5)
+
+            # 以一定概率混入脉冲噪声，增强多样性
+            if torch.rand(1).item() < self.pulse_noise_prob:
+                pulse_noise = self.generate_targeted_noise(z_perturbed.shape, device=device)
+                noise = noise + pulse_noise * 0.1  # 脉冲噪声权重可调
+
+            z_perturbed = z_perturbed - 0.5 * sgld_step_size * grad + noise
+
         return z_perturbed
-
-    def generate_targeted_noise(self, shape, device):
-        """
-        生成非高斯"精确制导"噪声，示例为稀疏脉冲噪声。
-        """
-        noise = torch.zeros(shape, device=device)
-        batch_size = shape[0]
-        num_spikes = max(1, batch_size // 10)  # 例如批量大小的十分之一
-
-        for _ in range(num_spikes):
-            idx = torch.randint(0, batch_size, (1,))
-            noise[idx] = torch.randn_like(noise[idx]) * 5.0  # 放大扰动幅度
-
-        return noise
     
     def adaptive_noise(self, risk_level):
         """
@@ -184,6 +200,8 @@ class PrivacyDetectionUnit(nn.Module):
         self.device = device
         self.feature_dim = feature_dim
 
+        self.node_feat_proj = nn.Linear(768, feature_dim)
+
         # BioBERT 文本编码器和 tokenizer
         self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
         self.biobert = BertModel.from_pretrained(bert_model_name).to(device)
@@ -205,6 +223,23 @@ class PrivacyDetectionUnit(nn.Module):
             nn.Linear(feature_dim // 2, 1),
             nn.Sigmoid()
         )
+    
+    def build_node_features(self, entities, device=None):
+        if device is None:
+            device = self.device  # 默认用类里保存的设备
+        features = []
+        with torch.no_grad():
+            for ent in entities:
+                inputs = self.tokenizer(ent, return_tensors="pt", truncation=True, max_length=10).to(device)
+                outputs = self.biobert(**inputs)
+                cls_emb = outputs.last_hidden_state[:, 0, :].squeeze(0)  # 768维
+                features.append(cls_emb)
+        features = torch.stack(features).to(device)  # [num_nodes, 768]
+        features = self.node_feat_proj(features)    # 投影到 feature_dim (512)
+        return features
+    
+
+
 
     def keyword_risk_score(self, text_prompts):
         """
@@ -375,6 +410,15 @@ class ImmuneMemoryModule(nn.Module):
         return relevant_memory
 
 
+
+class EmbeddingProjector(nn.Module):
+    def __init__(self, input_dim=512, output_dim=768):
+        super().__init__()
+        self.projector = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        return self.projector(x)
+
 # 移除了 NeRFEncoder 中的 self_destruct，因为这个机制（细胞凋亡）
 # 更适合在主模型检测到高持续风险或对抗攻击时触发，可能涉及禁用某些层或连接。
 # 可以创建一个独立的 ApoptosisModule 或在主训练循环中实现该逻辑。
@@ -383,26 +427,85 @@ class ImmuneMemoryModule(nn.Module):
 
 class ApoptosisMechanism:
     """
-    细胞凋亡机制 (Placeholder)
+    细胞凋亡机制 (Apoptosis Mechanism)
+    在响应持续性高风险时，通过前向钩子动态禁用UNet的注意力模块。
     """
-    def __init__(self, risk_threshold=0.95, trigger_patience=5):
+    def __init__(self, model_unet, attention_module_class=Attention, risk_threshold=0.9, trigger_patience=3):
+        """
+        参数:
+            model_unet (nn.Module): 需要被保护的UNet模型。
+            attention_module_class (type): 需要被监控的注意力模块的类名。
+            risk_threshold (float): 风险阈值，超过这个值的风险评分被认为是高风险。
+            trigger_patience (int): 触发凋亡需要连续检测到高风险输入的次数。
+        """
+        self.model_unet = model_unet
+        self.attention_module_class = attention_module_class
         self.risk_threshold = risk_threshold
         self.trigger_patience = trigger_patience
-        self.high_risk_counter = 0
+        self.hooks = []
+        
+        # 状态变量
+        self.high_risk_counter = 0      # 高风险计数器
+        self.apoptosis_active = False   # 凋亡激活状态
 
-    def check_and_trigger(self, current_risk_score, model_unet):
+        self._register_hooks()
+
+    def _hook_fn(self, module, input, output):
+        """这个前向钩子函数会在每个注意力模块前向传播时执行。"""
+        if self.apoptosis_active:
+            # 如果凋亡机制已被激活，则拦截其输出，并替换为一个全零的张量。
+            # 这就等效于“禁用”了这个注意力模块的贡献。
+            return torch.zeros_like(output)
+        else:
+            # 否则，让模块的原始输出正常通过。
+            return output
+
+    def _register_hooks(self):
+        """查找UNet中所有的注意力模块，并为它们注册前向钩子。"""
+        print("正在为UNet注意力模块注册细胞凋亡钩子...")
+        for name, module in self.model_unet.named_modules():
+            if isinstance(module, self.attention_module_class):
+                handle = module.register_forward_hook(self._hook_fn)
+                self.hooks.append(handle)
+        print(f"成功注册 {len(self.hooks)} 个钩子。")
+
+    def check_and_trigger(self, current_risk_score):
+        """
+        检查当前的风险评分，并更新凋亡状态。
+        这个函数应该在每次评估时（例如，处理每一批提示词时）被调用一次。
+        """
+        if self.apoptosis_active:
+             # 如果已经触发，则保持激活状态，直到被手动重置。
+             return True
+
         if current_risk_score > self.risk_threshold:
             self.high_risk_counter += 1
+            print(f"细胞凋亡机制: 检测到高风险 (评分: {current_risk_score:.4f})。计数器: {self.high_risk_counter}/{self.trigger_patience}。")
         else:
+            # 如果风险下降，则重置计数器。系统暂时安全。
             self.high_risk_counter = 0
 
         if self.high_risk_counter >= self.trigger_patience:
-            print("Apoptosis Triggered: High risk detected consistently.")
-            # Placeholder: 实际应禁用 UNet 中的某些层或连接
-            # e.g., for layer in model_unet.attention_layers: layer.enabled = False
-            self.high_risk_counter = 0 # Reset after triggering
-            return True # Indicates triggered
+            print(f"\n!!! 细胞凋亡已触发 !!!\n由于检测到持续性高风险，已禁用注意力模块。此状态将维持直到被重置。\n")
+            self.apoptosis_active = True
+            return True
+        
         return False
+
+    def reset(self):
+        """手动重置机制，使其恢复到默认的、未触发的状态。"""
+        print("正在重置细胞凋亡机制的状态。")
+        self.high_risk_counter = 0
+        self.apoptosis_active = False
+
+    def remove_hooks(self):
+        """移除所有已注册的钩子，以清理并恢复模型的原始行为。"""
+        print(f"正在移除 {len(self.hooks)} 个细胞凋亡钩子。")
+        for handle in self.hooks:
+            handle.remove()
+        self.hooks = []
+
+
 
 def epigenetic_prompt_encoding(prompt: str) -> str:
     """

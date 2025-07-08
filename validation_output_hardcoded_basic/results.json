@@ -26,7 +26,7 @@
         "clip_model_id": "openai/clip-vit-base-patch32",
         "sli_leak_threshold": 0.1
     },
-    "fid": 35.066768646240234,
+    "fid": 473.12841796875,
     "sli": 1.0,
     "ard": 1.0
 }

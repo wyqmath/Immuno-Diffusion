@@ -3,29 +3,41 @@
 
 import torch
 import argparse
-from PIL import Image
 import numpy as np
-from tqdm import tqdm
 import os
 import pathlib # For save_results to handle Path objects if any in args
 import spacy
 import clip
-from torch_geometric.data import Data
+import hashlib
+import json
 import requests
+import torchvision.models as models
+import torch.nn.functional as F
+import torch.nn as nn
+
+from PIL import Image
+from tqdm import tqdm
+from torch_geometric.data import Data
 from pathlib import Path
 from torchvision import transforms
 from diffusers import AutoencoderKL, UNet2DConditionModel, EulerDiscreteScheduler
 # from diffusers.utils import randn_tensor # -> Replaced with torch.randn
 from transformers import CLIPTextModel, CLIPTokenizer
-from torch_geometric.data import Data
+
 # 导入简化的PDU和SEU
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit 
-from torch_geometric.data import Data
+
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit, ImmuneMemoryModule
-import torchvision.models as models
-import torch.nn.functional as F
+
 from torchmetrics.image.fid import FrechetInceptionDistance
 from PIL import Image
+from transformers import BertModel, BertTokenizer
+from collections import defaultdict
+from epigenetic_encoding.epigenetic_encoding import RealNVP
+from transformers import CLIPTokenizer, CLIPTextModel
+from diffusers.models.attention import Attention
+from Immuno_Diffusion import EmbeddingProjector
+from Immuno_Diffusion import ApoptosisMechanism
 
 print(f"--- Python Script Start ---")
 # 先设置节点在终端$env:HF_ENDPOINT = "https://hf-mirror.com"
@@ -34,6 +46,27 @@ print(f"--- End of ENV Check ---")
 
 
 nlp = spacy.load("en_core_web_sm")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 初始化CLIP tokenizer和text_encoder
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+text_encoder.eval()
+
+# 初始化归一化流模型并加载权重
+embedding_dim = 768  # 根据你的模型调整
+flow_model = RealNVP(dim=embedding_dim, hidden_dim=256, num_coupling_layers=6).to(device)
+weight_path = os.path.join("epigenetic_encoding", "checkpoints", "flow_model_weights.pth")
+checkpoint = torch.load(weight_path, map_location=device)
+projector = EmbeddingProjector(input_dim=512, output_dim=768).to(device)
+projector.load_state_dict(checkpoint['projector_state_dict'])
+flow_model.load_state_dict(checkpoint['flow_model_state_dict'])
+
+projector.eval()
+flow_model.eval()
+
+
+
 
 def extract_entities(text):
     """
@@ -66,41 +99,105 @@ def query_conceptnet_edges(entities):
             print(f"ConceptNet query failed for {e1}: {ex}")
     return edges, entity_to_idx
 
-def build_node_features(entities, feature_dim=512):
-    """
-    简单示例：用随机向量作为节点特征
-    你可以用更复杂的词向量或预训练模型生成特征
-    """
-    return torch.randn(len(entities), feature_dim)
+nlp = spacy.load("en_core_web_sm")
+bert_model_name = "bert-base-uncased"
+bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+bert_model = BertModel.from_pretrained(bert_model_name).eval()
+    
+CACHE_DIR = "./conceptnet_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-def create_concept_graph_from_prompts(prompts, feature_dim=512, device='cpu'):
+def cache_get(key):
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+def cache_set(key, data):
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def create_concept_graph_from_prompts(prompts, pdu, device='cpu'):
     """
     输入：文本提示词列表
     输出：torch_geometric.data.Data 对象，批量图
     """
+# 初始化spaCy和BERT（建议放到模块级别，只初始化一次）
+    
+
+    
+
+    def extract_entities(text):
+        doc = nlp(text)
+        ents = set()
+        for ent in doc.ents:
+            lemma = ent.lemma_.lower()
+            if lemma:
+                ents.add(lemma)
+        return list(ents)
+
+    def query_conceptnet_edges(entities):
+        edges = []
+        entity_to_idx = {e: i for i, e in enumerate(entities)}
+
+        for e1 in entities:
+            cache_key = hashlib.md5(e1.encode("utf-8")).hexdigest()
+            cached_resp = cache_get(cache_key)
+            if cached_resp is not None:
+                resp = cached_resp
+            else:
+                url = f"http://api.conceptnet.io/c/en/{e1.replace(' ', '_')}"
+                try:
+                    resp = requests.get(url).json()
+                    cache_set(cache_key, resp)
+                except Exception as ex:
+                    print(f"ConceptNet query failed for {e1}: {ex}")
+                    continue
+
+            for edge in resp.get('edges', []):
+                start = edge['start']['label'].lower()
+                end = edge['end']['label'].lower()
+                rel = edge.get('rel', {}).get('label', '').lower()
+                weight = edge.get('weight', 1.0)
+
+                allowed_rels = {'related to', 'is a', 'part of', 'used for', 'has property'}
+                if rel not in allowed_rels:
+                    continue
+                if weight < 1.0:
+                    continue
+
+                if start in entity_to_idx and end in entity_to_idx:
+                    src = entity_to_idx[start]
+                    tgt = entity_to_idx[end]
+                    edges.append((src, tgt, weight))
+
+        return edges, entity_to_idx
+
+
     all_entities = []
     for prompt in prompts:
         ents = extract_entities(prompt)
-        print(f"Prompt: {prompt} -> Entities: {ents}")  # 调试打印
         all_entities.append(ents)
 
-    # 合并所有实体，去重
     unique_entities = list(set([e for ents in all_entities for e in ents]))
-
     if len(unique_entities) == 0:
-        # 没提取到实体，构造最小图，避免空张量
-        x = torch.zeros((1, feature_dim), device=device)
+        x = torch.zeros((1, pdu.feature_dim), device=device)
         edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_weight = torch.empty((0,), dtype=torch.float, device=device)
         batch = torch.zeros((1,), dtype=torch.long, device=device)
-        return Data(x=x, edge_index=edge_index, batch=batch)
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_weight, batch=batch)
 
-    edges, entity_to_idx = query_conceptnet_edges(unique_entities)
-    x = build_node_features(unique_entities, feature_dim).to(device)
+    edges_with_weight, entity_to_idx = query_conceptnet_edges(unique_entities)
+    x = pdu.build_node_features(unique_entities, device=device)
 
-    if len(edges) > 0:
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(device)
+    if len(edges_with_weight) > 0:
+        edge_index = torch.tensor([(src, tgt) for src, tgt, w in edges_with_weight], dtype=torch.long).t().contiguous().to(device)
+        edge_weight = torch.tensor([w for src, tgt, w in edges_with_weight], dtype=torch.float).to(device)
     else:
         edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_weight = torch.empty((0,), dtype=torch.float, device=device)
 
     batch = []
     for i, ents in enumerate(all_entities):
@@ -108,7 +205,7 @@ def create_concept_graph_from_prompts(prompts, feature_dim=512, device='cpu'):
             batch.append(i)
     batch = torch.tensor(batch, dtype=torch.long, device=device)
 
-    data = Data(x=x, edge_index=edge_index, batch=batch)
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, batch=batch)
     return data
 
 
@@ -170,7 +267,7 @@ def parse_args():
 from Immuno_Diffusion import PrivacyDetectionUnit, PrivacyEnhancementUnit, ImmuneMemoryModule
 
 def load_models(args):
-    print("Loading models...")
+    print("正在加载模型...")
     device = torch.device(args.device)
     model_id = args.model_id
 
@@ -181,11 +278,41 @@ def load_models(args):
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
     scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-    pdu, seu, memory = None, None, None
-    clip_model, clip_preprocess = None, None  # 先初始化
+    # --- 归一化流模型初始化 ---
+    embedding_dim_in = 512  # CLIP文本嵌入维度
+    embedding_dim_out = 768
+
+    projector = EmbeddingProjector(input_dim=embedding_dim_in, output_dim=embedding_dim_out).to(device)
+    flow_model = RealNVP(dim=embedding_dim_out, hidden_dim=256, num_coupling_layers=6).to(device)
+
+    weight_path = os.path.join("epigenetic_encoding", "checkpoints", "flow_model_weights.pth")
+
+    print(f"Loading flow model weights from: {weight_path}")
+    if os.path.exists(weight_path):
+        file_size = os.path.getsize(weight_path) / (1024 * 1024)  # 转换为MB
+        print(f"Weight file size: {file_size:.2f} MB")
+
+        checkpoint = torch.load(weight_path, map_location=device)
+        projector.load_state_dict(checkpoint['projector_state_dict'])
+        flow_model.load_state_dict(checkpoint['flow_model_state_dict'])
+
+        projector.eval()
+        flow_model.eval()
+    else:
+        print("Weight file does not exist!")
+
+
+
+
+    dim_reducer = nn.Identity().to(device)  # 恒等映射，不改变维度
+    dim_reducer.eval()
+
+    pdu, seu, memory, apoptosis = None, None, None, None # 将 apoptosis 初始化为 None
+    clip_model, clip_preprocess = None, None
 
     if args.enable_privacy:
-        print(f"Privacy mechanisms enabled. Initializing simplified PDU, SEU and ImmuneMemoryModule.")
+        print(f"隐私保护机制已启用。正在初始化 PDU, SEU 和 ImmuneMemoryModule。")
+        # ... pdu, seu, memory 的初始化代码 ...
         pdu = PrivacyDetectionUnit(sensitive_keywords=args.pdu_sensitive_keywords, device=args.device, feature_dim=512).to(device)
         seu_latent_dim = unet.config.in_channels
         seu = PrivacyEnhancementUnit(latent_dim=seu_latent_dim, simple_noise_level=args.seu_noise_level).to(device)
@@ -197,9 +324,18 @@ def load_models(args):
         }
         memory = ImmuneMemoryModule(**memory_config).to(device)
         clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
-        print(f"PDU, SEU, ImmuneMemoryModule and CLIP model initialized.")
+        # --- 添加以下部分来初始化 ApoptosisMechanism ---
+        print("正在初始化细胞凋亡机制...")
+        apoptosis = ApoptosisMechanism(
+            model_unet=unet,
+            attention_module_class=Attention,
+            risk_threshold=0.9,    # 可自定义：被视为威胁的风险评分
+            trigger_patience=2     # 可自定义：连续检测到2次高风险输入后触发
+        )
+        # --- 新增部分结束 ---
+
     else:
-        print("Privacy mechanisms disabled.")
+        print("隐私保护机制已禁用。")
 
     models = {
         "tokenizer": tokenizer,
@@ -207,17 +343,24 @@ def load_models(args):
         "vae": vae,
         "unet": unet,
         "scheduler": scheduler,
+        "flow_model": flow_model,  # 加入模型字典
+        "dim_reducer": dim_reducer,
+        "device": device,
         "pdu": pdu,
         "seu": seu,
         "memory": memory,
+        "apoptosis": apoptosis, # 将凋亡机制添加到 models 字典中
         "clip_model": clip_model,
         "clip_preprocess": clip_preprocess,
         "device": device,
         "vae_scale_factor": 2 ** (len(vae.config.block_out_channels) - 1),
     }
 
-    print("Models dictionary created.")
+    print("模型字典已创建。")
     return models
+
+
+
 
 def load_dataset(args):
     """Loads the evaluation dataset. If args.dataset_path is 'internal_test_prompts', uses hardcoded prompts."""
@@ -300,7 +443,12 @@ def load_dataset(args):
 # ... prepare_text_input, prepare_graph_input remain placeholders ...
 
 @torch.no_grad()
-def generate_images(prompts, models, args):
+def generate_images(prompts, models, args, dim_reducer):
+    print(f"generate_images received prompts type: {type(prompts)}")
+    print(f"generate_images received prompts length: {len(prompts)}")
+    print(f"generate_images received prompts sample: {prompts[:3]}")
+    
+    
     """Generates images using the base diffusion model, with optional simplified privacy modules."""
     if args.enable_privacy and models.get("pdu") and models.get("seu"):
         print(f"Generating images with simplified PDU/SEU privacy mechanisms enabled (SEU Noise: {args.seu_noise_level}).")
@@ -318,12 +466,14 @@ def generate_images(prompts, models, args):
     pdu = models.get("pdu")
     seu = models.get("seu")
     memory = models.get("memory")  # 新增：获取免疫记忆模块
+    apoptosis = models.get("apoptosis") # 获取细胞凋亡机制对象
+
 
     height = args.image_size
     width = args.image_size
     num_inference_steps = args.num_inference_steps
     guidance_scale = args.guidance_scale
-    batch_size = args.batch_size
+    global_batch_size = args.batch_size
 
     # Use a generator for reproducible results if seed is provided
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
@@ -333,40 +483,85 @@ def generate_images(prompts, models, args):
             torch.cuda.manual_seed_all(args.seed)  # check device type
 
     generated_images_pil = []
-    num_batches = (len(prompts) + batch_size - 1) // batch_size
+    print(f"Total prompts received: {len(prompts)}")
+    print(f"Batch size: {global_batch_size}")
+    num_batches = (len(prompts) + global_batch_size - 1) // global_batch_size
+    print(f"Number of batches: {num_batches}")
+    # 重置细胞凋亡状态，确保每次生成干净
+    if apoptosis:
+        if hasattr(apoptosis, "reset"):
+            apoptosis.reset()
+        else:
+            # 如果没有reset方法，手动重置内部状态
+            apoptosis.high_risk_counter = 0
+            apoptosis.apoptosis_active = False
 
     pdu = models.get("pdu")
     seu = models.get("seu")
     memory = models.get("memory")  # 新增：获取免疫记忆模块
 
     for i in tqdm(range(num_batches), desc="Generating Batches"):
-        batch_prompts = prompts[i * batch_size : (i + 1) * batch_size]
+        batch_prompts = prompts[i * global_batch_size : (i + 1) * global_batch_size]
         current_batch_size = len(batch_prompts)
-
+        print(f"Batch {i+1} prompts: {batch_prompts}")
+        if not batch_prompts:
+            print("Warning: Empty batch prompts, skipping batch.")
+            continue
         # 文本编码部分（保持不变）
         text_input = tokenizer(batch_prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
-        text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
+        uncond_input = tokenizer([""] * current_batch_size, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+        with torch.no_grad():
+            uncond_embeddings_raw = text_encoder(uncond_input.input_ids.to(device))[0]  # [batch_size, seq_len, 768]
 
+            text_embeddings_raw = text_encoder(text_input.input_ids.to(device))[0]  # [batch_size, seq_len, 768]
+            uncond_embeddings = dim_reducer(uncond_embeddings_raw)  # 恒等映射，维度不变
+            batch_size, seq_len, dim = text_embeddings_raw.shape
+            text_embeddings_2d = text_embeddings_raw.view(batch_size * seq_len, dim)
+
+            # 3. 用flow_model加密二维嵌入
+            encrypted_embeddings_2d, _ = flow_model(text_embeddings_2d, reverse=False)
+
+            # 4. 恢复成三维张量，供UNet使用
+            encrypted_embeddings = encrypted_embeddings_2d.view(batch_size, seq_len, -1)
+            
+
+            
+            
         if guidance_scale > 1.0:
-            max_length = text_input.input_ids.shape[-1]
-            uncond_input = tokenizer([""] * current_batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
-            uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_embeddings = torch.cat([uncond_embeddings, encrypted_embeddings], dim=0)
+            batch_size = text_embeddings.shape[0]
+        else:
+            text_embeddings = encrypted_embeddings
+            batch_size = encrypted_embeddings.shape[0]
+        # 确保输入UNet的维度是3维
+        text_embeddings = text_embeddings.contiguous()
 
         latents_shape = (current_batch_size, unet.config.in_channels, height // vae_scale_factor, width // vae_scale_factor)
         latents = torch.randn(latents_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
         latents = latents * scheduler.init_noise_sigma
 
+
+        # 打印张量形状，方便调试
+        print(f"uncond_embeddings shape: {uncond_embeddings.shape}")
+        print(f"encrypted_embeddings shape: {encrypted_embeddings.shape}")
+        print(f"text_embeddings shape after concat: {text_embeddings.shape}")
+        print(f"latents shape: {latents.shape}")
         # 这里开始替换为你给出的代码段
         current_risk_score = None
         memory_signal = None  # 新增初始化
 
         if args.enable_privacy and pdu and seu and memory:
-            concept_graph = create_concept_graph_from_prompts(batch_prompts, feature_dim=512, device=device)
+            concept_graph = create_concept_graph_from_prompts(batch_prompts, pdu, device=device)
             risk_score_batch, combined_features = pdu(batch_prompts, concept_graph)
             current_risk_score = risk_score_batch
             print(f"Batch {i+1} PDU risk scores: {current_risk_score.squeeze().tolist()}")
 
+            # --- 添加这部分代码来检查是否触发细胞凋亡 ---
+            if apoptosis:
+                # 机制的内部计数器会跨批次跟踪高风险。
+                # 它会检查当前批次的平均风险。
+                apoptosis.check_and_trigger(current_risk_score.mean().item())
+            #--- 检查结束
             if current_risk_score.mean() > 0.5:
                 memory.update_memory(combined_features)
                 memory_signal = memory.query_memory(combined_features)
@@ -380,10 +575,14 @@ def generate_images(prompts, models, args):
         timesteps = scheduler.timesteps
 
         for t_idx, t in enumerate(tqdm(timesteps, leave=False, desc="Denoising Steps")):
+
             latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
             latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-
+            # 打印形状，方便调试
+            print(f"latent_model_input shape: {latent_model_input.shape}")
+            print(f"text_embeddings shape: {text_embeddings.shape}")
             noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+
 
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -443,8 +642,12 @@ def calculate_fid(generated_images_pil, reference_path, models, args):
     gen_tensors = preprocess_images(generated_images_pil, device)
 
     fid_metric = FrechetInceptionDistance(feature=2048).to(device)
-    fid_metric.update(real_tensors, real=True)
-    fid_metric.update(gen_tensors, real=False)
+    real_tensors_uint8 = (real_tensors * 255).to(torch.uint8)
+    gen_tensors_uint8 = (gen_tensors * 255).to(torch.uint8)
+
+    fid_metric.update(real_tensors_uint8, real=True)
+    fid_metric.update(gen_tensors_uint8, real=False)
+    
 
     fid_value = fid_metric.compute().item()
     print(f"FID: {fid_value}")
@@ -670,7 +873,6 @@ def save_results(results, args, prompts):
     """Saves results and generated images."""
     os.makedirs(args.output_dir, exist_ok=True)
     results_path = os.path.join(args.output_dir, "results.json")
-    import json
     try:
         # Convert Path objects and other non-serializable types to string for JSON
         serializable_config = {}
@@ -754,8 +956,11 @@ def main():
     print(f"Effective Arguments: {vars(args)}")
 
     models = load_models(args)
+    dim_reducer = models["dim_reducer"]
     prompts, sensitive_flags, sli_keywords = load_dataset(args)
     
+    print(f"prompts before Image Generations: {prompts}")
+
     # Ensure prompts, sensitive_flags are aligned for SLI
     if len(prompts) != len(sensitive_flags):
         print(f"Warning: Mismatch between number of prompts ({len(prompts)}) and sensitive_flags ({len(sensitive_flags)}). This might affect SLI calculation.")
@@ -766,7 +971,7 @@ def main():
         sensitive_flags = sensitive_flags[:len(prompts)]
 
 
-    generated_images_pil_list = generate_images(prompts, models, args)
+    generated_images_pil_list = generate_images(prompts, models, args, dim_reducer=dim_reducer)
 
     fid_score = calculate_fid(generated_images_pil_list, args.reference_fid_path, models, args)
     sli_score = calculate_sli(generated_images_pil_list, prompts, sensitive_flags, sli_keywords, models, args)
