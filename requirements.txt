@@ -1,0 +1,14 @@
+torch
+torchvision
+numpy
+spacy
+openai-clip
+transformers
+diffusers
+datasets
+pandas
+tqdm
+requests
+torchmetrics[image]
+torch_geometric
+Pillow

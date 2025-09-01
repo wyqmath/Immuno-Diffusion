@@ -239,8 +239,6 @@ class PrivacyDetectionUnit(nn.Module):
         return features
     
 
-
-
     def keyword_risk_score(self, text_prompts):
         """
         基于规则的关键词检测风险评分
@@ -530,7 +528,7 @@ class ImmunoDiffusionModel(nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(self.device)
         self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(self.device)
         self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(self.device)
-        self.scheduler = PNDMScheduler.from_pretrained(model_id, subfolder="scheduler")
+        self.scheduler = DPMSolverMultistepScheduler.from_pretrained(model_id, subfolder="scheduler")
 
         # 冻结 VAE 和 Text Encoder 的参数，因为我们通常不训练它们
         for param in self.vae.parameters():
